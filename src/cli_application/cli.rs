@@ -20,6 +20,7 @@ use crate::sanitizer_engine::engine_structs::{InputSource, Policy};
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Input files, directories or URLs
+    #[arg(required = true, num_args = 1..)]
     pub inputs: Vec<String>,
 
     /// Policy configuration file (JSON)
@@ -114,4 +115,61 @@ pub async fn run() -> Result<()> {
 
 
     Ok(())
+}
+
+
+
+
+
+
+
+
+
+
+
+
+/*======================== TESTS ============================*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_default_args() {
+        let args = Args::try_parse_from(&["test", "input1.html"]).unwrap();
+        assert_eq!(args.inputs, vec!["input1.html"]);
+        assert_eq!(args.policy, PathBuf::from("default_policy.json"));
+        assert_eq!(args.output_dir, PathBuf::from("output"));
+        assert_eq!(args.workers, 4);
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn test_multiple_inputs() {
+        let args = Args::try_parse_from(&["test", "input1.html", "input2.html", "http://example.com"]).unwrap();
+        assert_eq!(args.inputs, vec!["input1.html", "input2.html", "http://example.com"]);
+    }
+
+    #[test]
+    fn test_custom_flags() {
+        let args = Args::try_parse_from(&[
+            "test",
+            "input.html",
+            "--policy", "custom_policy.json",
+            "--output-dir", "custom_output",
+            "--workers", "8",
+            "--verbose"
+        ]).unwrap();
+        assert_eq!(args.policy, PathBuf::from("custom_policy.json"));
+        assert_eq!(args.output_dir, PathBuf::from("custom_output"));
+        assert_eq!(args.workers, 8);
+        assert!(args.verbose);
+    }
+
+    #[test]
+    fn test_missing_input_fails() {
+        let result = Args::try_parse_from(&["test"]);
+        assert!(result.is_err());
+    }
 }
