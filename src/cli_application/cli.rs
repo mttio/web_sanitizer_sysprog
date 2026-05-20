@@ -6,11 +6,12 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 use std::path::{Path, PathBuf};
 use std::fs;
 use clap::Parser;
+use crate::sanitizer_engine::engine_structs::InputSource;
+use crate::sanitizer_engine::policy::Policy;
 use anyhow::{Context, Result};
 use url::Url;
 use walkdir::WalkDir;
 use serde_json;
-use crate::sanitizer_engine::engine_structs::{InputSource, Policy};
 
 
 

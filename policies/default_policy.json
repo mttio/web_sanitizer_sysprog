@@ -1,14 +1,19 @@
 {
   "html": {
     "allow_scripts": [],
-    "allow_origins": ["trusted.com"],
+    "allow_origins": [
+      "trusted.com"
+    ],
     "strip_event_handlers": true,
     "rewrite_dangerous_uris": true
   },
   "urls": {
-    "block_list": ["malicious-domain.com", "evil.com"],
-    "rewrite_suspicious": true,
-    "allow_idn": false
+    "dangerous_domains": [
+      "malicious-domain.com",
+      "evil.com"
+    ],
+    "dangerous_domain_action": "warn_and_replace",
+    "idn_action": "deny"
   },
   "resources": {
     "fetch_sub_resources": true,
