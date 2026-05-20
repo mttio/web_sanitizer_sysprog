@@ -19,13 +19,8 @@ use crate::sanitizer_engine::engine_structs::{InputSource, Policy};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Input files or directories
-    #[arg(short, long)]
+    /// Input files, directories or URLs
     pub inputs: Vec<String>,
-
-    /// URL inputs
-    #[arg(short, long)]
-    pub urls: Vec<String>,
 
     /// Policy configuration file (JSON)
     #[arg(short, long, default_value = "default_policy.json")]
@@ -69,42 +64,37 @@ pub async fn run() -> Result<()> {
     // Prepare inputs
     let mut sources = Vec::new();
 
-    //take care of file and folder inputs
     for input in args.inputs {
-        let path = PathBuf::from(&input);
-
-        if path.is_dir() //DIRECTORY
-        {
-            // Explore directory recursively
-            for entry in WalkDir::new(path) {
-                let entry = entry.context("Failed to read directory entry")?;
-                if entry.file_type().is_file() {
-                    sources.push(InputSource::File(entry.path().to_path_buf()));
-                };
+        // Try to parse as URL first
+        if let Ok(url) = Url::parse(&input) {
+            if url.scheme() == "http" || url.scheme() == "https" {
+                println!("Input '{}' recognized as URL", input);
+                sources.push(InputSource::Url(url));
+                continue;
             }
         }
-        else //SINGLE FILE
-        {
+
+        let path = PathBuf::from(&input);
+        if path.is_dir() {
+            println!("Input '{}' recognized as Directory", input);
+            // Explore directory recursively
+            for entry in WalkDir::new(&path) {
+                let entry = entry.with_context(|| format!("Failed to read directory entry in {:?}", path))?;
+                if entry.file_type().is_file() {
+                    sources.push(InputSource::File(entry.path().to_path_buf()));
+                }
+            }
+        } else if path.is_file() {
+            println!("Input '{}' recognized as File", input);
             sources.push(InputSource::File(path));
-        };
-    };
-
-
-    //add URLs to input sources as well
-    for url_str in args.urls {
-        let url = Url::parse(&url_str).context(format!("Invalid URL: {}", url_str))?;
-        sources.push(InputSource::Url(url));
+        } else {
+            println!("Warning: Input '{}' not found or not a supported URL scheme. Skipping.", input);
+        }
     }
 
-
-
-
-
-
-
-    //No-sources case
+    // No-sources case
     if sources.is_empty() {
-        println!("No inputs provided.");
+        println!("No valid inputs provided.");
         return Ok(());
     }
 
