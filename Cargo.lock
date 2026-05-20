@@ -134,6 +134,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "either"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -146,8 +152,7 @@ dependencies = [
 [[package]]
 name = "form_urlencoded"
 version = "1.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+source = "git+https://github.com/psyvern/rust-url.git#e835731b0b3c402a0663465109cf6f08cb27baf3"
 dependencies = [
  "percent-encoding",
 ]
@@ -243,8 +248,7 @@ dependencies = [
 [[package]]
 name = "idna"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
+source = "git+https://github.com/psyvern/rust-url.git#e835731b0b3c402a0663465109cf6f08cb27baf3"
 dependencies = [
  "idna_adapter",
  "smallvec",
@@ -266,6 +270,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itoa"
@@ -370,8 +383,7 @@ dependencies = [
 [[package]]
 name = "percent-encoding"
 version = "2.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+source = "git+https://github.com/psyvern/rust-url.git#e835731b0b3c402a0663465109cf6f08cb27baf3"
 
 [[package]]
 name = "pin-project-lite"
@@ -655,8 +667,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "url"
 version = "2.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+source = "git+https://github.com/psyvern/rust-url.git#e835731b0b3c402a0663465109cf6f08cb27baf3"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -705,6 +716,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "itertools",
  "serde",
  "serde_json",
  "tokio",
