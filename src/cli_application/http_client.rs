@@ -1,9 +1,8 @@
-use crate::sanitizer_engine::engine_structs::{Content, InputSource};
+use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource, Policy};
 use anyhow::{anyhow, Context, Result};
 use hickory_resolver::TokioResolver;
 use reqwest::{Client, redirect, header};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
 use futures_util::StreamExt;
 
 
@@ -51,13 +50,13 @@ fn is_v6_private(v6: Ipv6Addr) -> bool {
 
 
 /// Fetch multiple URLs and return their content
-pub async fn fetch_urls(sources: Vec<InputSource>) -> Result<(Vec<Content>,Vec<anyhow::Error>)> {
+pub async fn fetch_multiple_urls(sources: Vec<InputSource>, policy: Policy) -> Result<(Vec<FetchedContent>,Vec<anyhow::Error>)> {
     let mut results_vec = Vec::new();
     let mut errors_vec = Vec::<anyhow::Error>::new();
 
     for input_source in sources {
         if let InputSource::Url(url) = input_source {
-            match fetch_url(&url).await {
+            match fetch_one_url(&url, &policy).await {
                 Ok(res) => results_vec.push(res),
                 Err(e) => errors_vec.push(anyhow!("Could not fetch url {:?}: {}", url, e)),
             }
@@ -67,27 +66,24 @@ pub async fn fetch_urls(sources: Vec<InputSource>) -> Result<(Vec<Content>,Vec<a
 }
 
 /// Fetch a single URL with strict security controls (Anti-SSRF, Timeouts, Limits)
-async fn fetch_url(url: &url::Url) -> Result<Content> {
-    // Passo 2: Risoluzione DNS manuale e isolata
-    let resolver = TokioResolver::builder_tokio()
-        .context("Failed to create DNS resolver builder")?
-        .build(); // This returns a Resolver in some versions, or Result in others.
-    
-    // The previous error showed it returns a Result.
-    let resolver = resolver.map_err(|e| anyhow!("Failed to build resolver: {}", e))?;
+async fn fetch_one_url(url: &url::Url, policy: &Policy) -> Result<FetchedContent> {
+    // Manual DNS resolution
+    let resolver = TokioResolver::builder_tokio().unwrap()
+        .build().unwrap();
 
     let host = url.host_str().ok_or_else(|| anyhow!("No host in URL"))?;
     
-    // We lookup the IP addresses for the host
+    // Lookup the IP addresses for the host
     let lookup = resolver.lookup_ip(host).await
-        .with_context(|| format!("DNS lookup failed for {}", host))?;
+        .with_context(|| format!("DNS lookup failed for host: {}", host))?;
 
-    // Passo 3: Validazione dell'IP (Il "Filtro" Anti-SSRF)
+    // IP validation (finds first safe IP)
     let safe_ip = lookup.iter()
         .find(|ip| is_safe_ip(*ip))
-        .ok_or_else(|| anyhow!("No safe (public) IP addresses found for host: {}", host))?;
+        //if no safe IP found
+        .ok_or_else(|| anyhow!("No safe IP addresses found for host: {}", host))?;
 
-    // Configurazione della Connessione, Timeouts e Redirects
+    // Connection, timeouts and redirects setup
     let port = url.port_or_known_default().unwrap_or(80);
     let socket_addr = SocketAddr::new(safe_ip, port);
 
@@ -95,9 +91,9 @@ async fn fetch_url(url: &url::Url) -> Result<Content> {
         // Force IP to prevent IP reassigning
         .resolve(host, socket_addr)
         // Set connection timeout
-        .connect_timeout(Duration::from_secs(3))
+        .connect_timeout(policy.timeouts.connection_timeout_secs)
         // Set overall timeout
-        .timeout(Duration::from_secs(30))
+        .timeout(policy.timeouts.overall_timeout_secs)
         // Policy sui Redirect
         .redirect(redirect::Policy::none())
         // Forzatura TLS 1.2+
@@ -122,7 +118,7 @@ async fn fetch_url(url: &url::Url) -> Result<Content> {
     // Streaming del Body con Limite di Byte (Max 5 MB)
     let mut stream = response.bytes_stream();
     let mut data = Vec::new();
-    let max_bytes = 5 * 1024 * 1024; 
+    let max_bytes = policy.resources.max_bytes; 
 
     while let Some(item) = stream.next().await {
         let chunk = item.context("Error while streaming body")?;
@@ -132,7 +128,7 @@ async fn fetch_url(url: &url::Url) -> Result<Content> {
         data.extend_from_slice(&chunk);
     }
 
-    Ok(Content {
+    Ok(FetchedContent {
         source: InputSource::Url(url.clone()),
         data,
         content_type,
