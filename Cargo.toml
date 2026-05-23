@@ -9,15 +9,15 @@ futures-util = "0.3"
 clap = { version = "4.6.1", features = ["derive"] }
 hickory-resolver = { version = "0.26.1", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-tokio = { version = "1.52.3", features = ["full"] }
-url = { version = "2.5.8", features = ["serde"]}
 itertools = "0.14.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-url = { git = "https://github.com/psyvern/rust-url.git", features = ["serde"]}
+url = { version = "2.5.8", features = ["serde"] }
 walkdir = "2.5.0"
+
+[patch.crates-io]
+form_urlencoded = { git = "https://github.com/psyvern/rust-url.git" }
+url = { git = "https://github.com/psyvern/rust-url.git" }
