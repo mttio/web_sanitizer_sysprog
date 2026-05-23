@@ -1,4 +1,5 @@
-use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource, Policy};
+use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource};
+use crate::sanitizer_engine::policy::Policy;
 use anyhow::{anyhow, Context, Result};
 use hickory_resolver::TokioResolver;
 use reqwest::{Client, redirect, header};

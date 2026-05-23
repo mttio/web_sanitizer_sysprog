@@ -8,10 +8,6 @@
     "rewrite_dangerous_uris": true
   },
   "urls": {
-    "block_list": ["malicious-domain.com", "evil.com"],
-    "rewrite_suspicious": true,
-    "allow_idn": false,
-    "replace_homography": true
     "dangerous_domains": [
       "malicious-domain.com",
       "evil.com"
