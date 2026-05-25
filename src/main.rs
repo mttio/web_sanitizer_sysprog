@@ -9,7 +9,7 @@ async fn main() {
 
     //run cli application
     if let Err(e) = cli::run().await {
-        eprintln!("{e:#?}");
+        eprintln!("Application error: {:?}", e);
     }
 
     println!("======================== GOODBYE =========================");

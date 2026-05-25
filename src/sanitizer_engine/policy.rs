@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 use url::Host;
 
@@ -31,6 +33,7 @@ pub struct Policy {
     pub html: HtmlPolicy,
     pub urls: UrlsPolicy,
     pub resources: ResourcesPolicy,
+    pub timeouts: TimeoutsPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +95,23 @@ impl Default for ResourcesPolicy {
             max_depth: 1,
             max_bytes: 1024 * 1024,
             max_requests: 5,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimeoutsPolicy {
+    #[serde(with = "humantime_serde")]
+    pub connection_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    pub overall_timeout: Duration,
+}
+
+impl Default for TimeoutsPolicy {
+    fn default() -> Self {
+        Self {
+            connection_timeout: Duration::from_secs(3),
+            overall_timeout: Duration::from_secs(15),
         }
     }
 }

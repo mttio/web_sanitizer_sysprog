@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Malicious Page</title>
+</head>
+<body>
+    <h1>XSS Test</h1>
+    <button onclick="alert('XSS1')">Click me</button>
+    <script>alert('XSS2')</script>
+    <img src="x" onerror="alert('XSS3')">
+    <a href="javascript:alert('XSS4')">Click for fun</a>
+    <iframe src="http://untrusted-origin.com"></iframe>
+    <meta http-equiv="refresh" content="0;url=http://malicious.com">
+</body>
+</html>

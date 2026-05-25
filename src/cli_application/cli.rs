@@ -53,7 +53,7 @@ pub async fn run() -> Result<()> {
 
 
     // Load policy
-    let base_policy_path = Path::new("./policies");
+    let base_policy_path = Path::new("policies");
     let content = fs::read_to_string(base_policy_path.join(&args.policy))
             .with_context(|| format!("Failed to read policy file: {:?}", &args.policy))?;
     let policy: Policy = serde_json::from_str(&content).context("Failed to parse policy file")?;
@@ -82,7 +82,7 @@ pub async fn run() -> Result<()> {
             // Explore directory recursively
             for entry in WalkDir::new(&path) {
                 let entry = entry.with_context(|| format!("Failed to read directory entry in {:?}", path))?;
-                if entry.file_type().is_file() {
+                if entry.file_type().is_file() && !is_hidden(&entry) {
                     sources.push(InputSource::File(entry.path().to_path_buf()));
                 }
             }
@@ -105,6 +105,23 @@ pub async fn run() -> Result<()> {
 
 
 
+    //Now for each source in sources we need to:
+    //   if is FILE
+                //if is HTML
+                    //sanitize html
+                //if is Asset
+                    //sanitize asset
+
+    //   if is URL
+            //fetch it safely
+                    //if is HTML
+                            //sanitize html
+                    //if is Asset
+                            //sanitize asset
+
+
+
+
 
 
     // Ensure output directory exists
@@ -120,9 +137,14 @@ pub async fn run() -> Result<()> {
 
 
 
+/*======================== HELPERS ============================*/
 
-
-
+fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+    entry.file_name()
+         .to_str()
+         .map(|s| s.starts_with('.'))
+         .unwrap_or(false)
+}
 
 
 

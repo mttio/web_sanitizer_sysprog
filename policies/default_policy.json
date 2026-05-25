@@ -20,5 +20,9 @@
     "max_depth": 1,
     "max_bytes": 1048576,
     "max_requests": 5
+  },
+  "timeouts": {
+    "connection_timeout": "3s",
+    "overall_timeout": "15s"
   }
 }
