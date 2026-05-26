@@ -24,8 +24,8 @@ pub struct Args {
     pub inputs: Vec<String>,
 
     /// Policy configuration file (JSON)
-    #[arg(short, long, default_value = "default_policy.json")]
-    pub policy: PathBuf,
+    #[arg(short, long)]
+    pub policy: Option<PathBuf>,
 
     /// Output directory for sanitised content and reports
     #[arg(short, long, default_value = "output")]
@@ -47,10 +47,14 @@ pub async fn run() -> Result<()> {
     println!("Successfully parsed args: {:?}", args);
 
     // Load policy
-    let base_policy_path = Path::new("policies");
-    let content = fs::read_to_string(base_policy_path.join(&args.policy))
-        .with_context(|| format!("Failed to read policy file: {:?}", &args.policy))?;
-    let policy: Policy = serde_json::from_str(&content).context("Failed to parse policy file")?;
+    let policy = match &args.policy {
+        Some(path) => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read policy file: {path:?}"))?;
+            serde_json::from_str(&content).context("Failed to parse policy file")?
+        }
+        None => Policy::default(),
+    };
 
     println!("Successfully loaded policy: {policy:#?}");
 
@@ -169,9 +173,9 @@ mod tests {
 
     #[test]
     fn test_default_args() {
-        let args = Args::try_parse_from(&["test", "input1.html"]).unwrap();
+        let args = Args::try_parse_from(["test", "input1.html"]).unwrap();
         assert_eq!(args.inputs, vec!["input1.html"]);
-        assert_eq!(args.policy, PathBuf::from("default_policy.json"));
+        assert_eq!(args.policy, None);
         assert_eq!(args.output_dir, PathBuf::from("output"));
         assert_eq!(args.workers, 4);
         assert!(!args.verbose);
@@ -180,7 +184,7 @@ mod tests {
     #[test]
     fn test_multiple_inputs() {
         let args =
-            Args::try_parse_from(&["test", "input1.html", "input2.html", "http://example.com"])
+            Args::try_parse_from(["test", "input1.html", "input2.html", "http://example.com"])
                 .unwrap();
         assert_eq!(
             args.inputs,
@@ -190,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_custom_flags() {
-        let args = Args::try_parse_from(&[
+        let args = Args::try_parse_from([
             "test",
             "input.html",
             "--policy",
@@ -202,7 +206,7 @@ mod tests {
             "--verbose",
         ])
         .unwrap();
-        assert_eq!(args.policy, PathBuf::from("custom_policy.json"));
+        assert_eq!(args.policy, Some(PathBuf::from("custom_policy.json")));
         assert_eq!(args.output_dir, PathBuf::from("custom_output"));
         assert_eq!(args.workers, 8);
         assert!(args.verbose);
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_missing_input_fails() {
-        let result = Args::try_parse_from(&["test"]);
+        let result = Args::try_parse_from(["test"]);
         assert!(result.is_err());
     }
 }
