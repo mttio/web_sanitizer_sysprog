@@ -135,7 +135,7 @@ impl SanitizerHttpClient {
             .iter()
             .map(|x| x.0.clone())
             .collect_vec();
-        let dangerous_domain_action = policy.urls.dangerous_domain_action;
+        let dangerous_domain_action = policy.connections.dangerous_domain_action;
         let idn_action = policy.urls.idn_action;
 
         let client = Client::builder()

@@ -3,7 +3,7 @@ use std::{error::Error, time::Duration};
 use serde::Deserialize;
 use url::Host;
 
-use crate::sanitizer_engine::errors::warn;
+use crate::sanitizer_engine::errors::{trace, warn};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,16 +18,50 @@ pub enum PolicyAction {
 impl PolicyAction {
     pub fn handle_error<E: Into<Box<dyn Error>>>(self, error: E) -> Result<(), E> {
         match self {
-            PolicyAction::Allow | PolicyAction::Replace => {}
-            PolicyAction::Warn | PolicyAction::WarnAndReplace => {
+            PolicyAction::Allow => {
+                trace(error);
+                Ok(())
+            }
+            PolicyAction::Replace => {
+                trace(error);
+                Ok(())
+            }
+            PolicyAction::Warn => {
                 warn(error);
+                Ok(())
             }
-            PolicyAction::Deny => {
-                return Err(error);
+            PolicyAction::WarnAndReplace => {
+                warn(error);
+                Ok(())
             }
+            PolicyAction::Deny => Err(error),
         }
+    }
 
-        Ok(())
+    pub fn handle_error_with<T, F: FnOnce() -> T, E: Into<Box<dyn Error>>>(
+        self,
+        function: F,
+        error: E,
+    ) -> Result<Option<T>, E> {
+        match self {
+            PolicyAction::Allow => {
+                trace(error);
+                Ok(None)
+            }
+            PolicyAction::Replace => {
+                trace(error);
+                Ok(Some(function()))
+            }
+            PolicyAction::Warn => {
+                warn(error);
+                Ok(None)
+            }
+            PolicyAction::WarnAndReplace => {
+                warn(error);
+                Ok(Some(function()))
+            }
+            PolicyAction::Deny => Err(error),
+        }
     }
 }
 
@@ -60,6 +94,8 @@ pub struct HtmlPolicy {
     pub allow_origins: Vec<PolicyHost>,
     pub strip_event_handlers: bool,
     pub rewrite_dangerous_uris: bool,
+    /// Action to perform when a dangerous domain is encountered
+    pub dangerous_domain_action: PolicyAction,
 }
 
 impl Default for HtmlPolicy {
@@ -73,14 +109,17 @@ impl Default for HtmlPolicy {
                 .collect(),
             strip_event_handlers: true,
             rewrite_dangerous_uris: true,
+            dangerous_domain_action: PolicyAction::WarnAndReplace,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UrlsPolicy {
+    /// List of domains considered dangerous
+    /// Ignores prefix labels (e.g. `youtube.com` matches `www.youtube.com`)
     pub dangerous_domains: Vec<PolicyHost>,
-    pub dangerous_domain_action: PolicyAction,
+    /// Action to perform when a non-latin url is encountered
     pub idn_action: PolicyAction,
 }
 
@@ -92,7 +131,6 @@ impl Default for UrlsPolicy {
                 .flat_map(Host::parse)
                 .map(PolicyHost)
                 .collect(),
-            dangerous_domain_action: PolicyAction::WarnAndReplace,
             idn_action: PolicyAction::Deny,
         }
     }
@@ -123,9 +161,14 @@ pub struct ConnectionsPolicy {
     pub connection_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub overall_timeout: Duration,
+    /// Maximum number of redirects for a single connection
     pub max_redirects: Option<usize>,
+    /// Action to perform when a connection exceeds `max_redirects`
     pub max_redirects_action: PolicyAction,
+    /// User agent to include in every request
     pub user_agent: String,
+    /// Action to perform when connecting to a dangerous domain
+    pub dangerous_domain_action: PolicyAction,
 }
 
 impl Default for ConnectionsPolicy {
@@ -136,6 +179,7 @@ impl Default for ConnectionsPolicy {
             max_redirects: Some(2),
             max_redirects_action: PolicyAction::Deny,
             user_agent: "CoolBot/0.0 (https://example.org/coolbot/; coolbot@example.org) generic-library/0.0".to_owned(),
+            dangerous_domain_action: PolicyAction::Deny,
         }
     }
 }

@@ -30,6 +30,14 @@ impl Display for IDN {
     }
 }
 
+pub fn trace<E: Into<Box<dyn Error>>>(error: E) {
+    println!(
+        "{}: {}",
+        "  TRACE".bright_black().bold(),
+        error.into().to_string().italic()
+    );
+}
+
 pub fn warn<E: Into<Box<dyn Error>>>(error: E) {
     println!(
         "{}: {}",
@@ -41,7 +49,7 @@ pub fn warn<E: Into<Box<dyn Error>>>(error: E) {
 pub fn error<E: Into<Box<dyn Error>>>(error: E) {
     println!(
         "{}: {}",
-        "ERROR".bright_red().bold(),
+        "  ERROR".bright_red().bold(),
         error.into().to_string().italic()
     );
 }

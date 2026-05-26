@@ -10,9 +10,12 @@ use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
 use anyhow::{Context, Result};
 use clap::Parser;
+use lol_html::{HtmlRewriter, Settings, element};
 use serde_json;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::error::Error;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -81,7 +84,7 @@ pub async fn run() -> Result<()> {
                         .iter()
                         .any(|x| host.matches(&x.0))
                     && let Err(e) = policy
-                        .urls
+                        .connections
                         .dangerous_domain_action
                         .handle_error(DangerousDomain(host.to_owned()))
                 {
@@ -89,6 +92,7 @@ pub async fn run() -> Result<()> {
                     continue;
                 }
             }
+
             println!("Input '{}' recognized as URL", input);
             sources.push(InputSource::Url(url.clone()));
         } else {
@@ -124,6 +128,67 @@ pub async fn run() -> Result<()> {
     println!("Successfully created input sources vector: {:?}", sources);
 
     let result = fetch_multiple_urls(sources, &policy).await.unwrap();
+
+    for (i, data) in result.0.into_iter().enumerate() {
+        // let input = client.execute(client.get(url).build()?).await?;
+
+        let mut output = File::create(format!("./output/{i}.html"))?;
+
+        let mut rewriter = HtmlRewriter::new(
+            Settings {
+                element_content_handlers: vec![element!("a[href], link[href]", |el| {
+                    let href = el.get_attribute("href").expect("href was required");
+                    if let Ok(mut href) = Url::parse(&href)
+                        && let Some(host) = href.host()
+                    {
+                        let host = host.to_owned();
+                        let is_dangerous = policy
+                            .urls
+                            .dangerous_domains
+                            .iter()
+                            .any(|x| x.0.matches(&host));
+
+                        if is_dangerous {
+                            let result = policy.html.dangerous_domain_action.handle_error_with(
+                                || -> Result<_, Box<dyn Error>> {
+                                    href.set_host(Some("example.com"))?;
+                                    el.set_attribute("href", href.as_ref())?;
+                                    Ok(())
+                                },
+                                DangerousDomain(host.to_owned()),
+                            );
+
+                            match result {
+                                Err(e) => error(e),
+                                Ok(Some(Err(e))) => error(e),
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    Ok(())
+                })],
+                ..Settings::new()
+            },
+            |c: &[u8]| {
+                // println!("{}\n", str::from_utf8(c).unwrap());
+                output.write_all(c).unwrap();
+            },
+        );
+
+        /* {
+            use futures_util::StreamExt;
+            let mut input = input.bytes_stream();
+
+            while let Some(chunk) = input.next().await {
+                let chunk = chunk?;
+                rewriter.write(&chunk)?;
+            }
+        } */
+
+        rewriter.write(&data.data)?;
+        rewriter.end()?;
+    }
 
     for error in result.1 {
         crate::sanitizer_engine::errors::error(error);
