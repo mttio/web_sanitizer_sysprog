@@ -4,8 +4,10 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 */
 
 use crate::cli_application::http_client::SanitizerHttpClient;
+use crate::sanitizer_engine::concurrency::ThreadPool;
 use crate::sanitizer_engine::engine_structs::InputSource;
 use crate::sanitizer_engine::errors::{DangerousDomain, IDN};
+use crate::sanitizer_engine::html::create_rewriter;
 use crate::sanitizer_engine::log::{LogLevel, Logger};
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
@@ -13,9 +15,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde_json;
 use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::task::JoinSet;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -108,24 +110,38 @@ pub async fn run() -> Result<()> {
 
     // println!("Successfully created input sources vector: {:?}", sources);
 
+    // Ensure output directory exists
+    fs::create_dir_all(&args.output_dir)
+        .with_context(|| format!("Failed to create output directory: {:?}", args.output_dir))?;
+
+    println!(
+        "Successfully created output directory: {:?}",
+        args.output_dir
+    );
+
     let client = SanitizerHttpClient::new(&policy).await?;
     let client = Arc::new(client);
     let policy = Arc::new(policy);
     let max_size = (sources.len() as f64).log10().ceil() as usize;
 
-    let mut tasks = JoinSet::new();
+    let pool = ThreadPool::new(args.workers); //thread pool is created with args.workers ready to work
+    let rt_handle = tokio::runtime::Handle::current();
+    let output_dir = Arc::new(args.output_dir);
+
     sources.into_iter().enumerate().for_each(|(i, source)| {
         let logger = Logger {
             path: Arc::new(PathBuf::new()),
             index: i,
             max_size,
         };
-        let output = File::create(args.output_dir.join(format!("{i}.html"))).unwrap();
         let client = Arc::clone(&client);
         let policy = Arc::clone(&policy);
-        tasks.spawn(async move {
-            let data = if let InputSource::Url(url) = source {
-                {
+        let rt_handle = rt_handle.clone();
+        let output_dir = Arc::clone(&output_dir);
+
+        pool.push_job(move || {
+            match source {
+                InputSource::Url(url) => {
                     if let Some(original) = check_domain(&url)
                         && let Err(e) = policy.urls.idn_action.handle_error(&logger, IDN(original))
                     {
@@ -147,48 +163,64 @@ pub async fn run() -> Result<()> {
                         logger.error(e);
                         return;
                     }
-                }
 
-                match client.fetch_one_url(&url, &logger, output, &policy).await {
-                    Ok(res) => Ok(res),
-                    Err(e) => Err(anyhow!("Could not fetch url {}: {}", url, e)),
-                }
-            } else {
-                Err(anyhow!("Moribus"))
-            };
+                    let output_path = output_dir.join(format!("{i}.html"));
+                    let output = match File::create(&output_path) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            logger.error(anyhow!("Failed to create output file {:?}: {}", output_path, e));
+                            return;
+                        }
+                    };
 
-            match data {
-                Ok(data) => {}
-                Err(error) => {
-                    logger.log(LogLevel::Error, error);
+                    let fetch_result = rt_handle.block_on(async {
+                        client.fetch_one_url(&url, &logger, output, &policy).await
+                    });
+
+                    match fetch_result {
+                        Ok(_) => {}
+                        Err(error) => {
+                            logger.log(LogLevel::Error, anyhow!("Could not fetch url {}: {}", url, error));
+                        }
+                    }
+                }
+                InputSource::File(path) => {
+                    let output_path = output_dir.join(format!("{i}.html"));
+                    let file_result = || -> Result<()> {
+                        let input_file = File::open(&path)
+                            .with_context(|| format!("Failed to open local file {:?}", path))?;
+                        let mut reader = BufReader::new(input_file);
+                        let output_file = File::create(&output_path)
+                            .with_context(|| format!("Failed to create output file {:?}", output_path))?;
+                        
+                        let mut rewriter = create_rewriter(&logger, &policy, output_file);
+                        let mut buffer = [0; 8192];
+                        loop {
+                            let n = reader.read(&mut buffer)
+                                .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
+                            if n == 0 {
+                                break;
+                            }
+                            rewriter.write(&buffer[..n])
+                                .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
+                        }
+                        rewriter.end()
+                            .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
+                        Ok(())
+                    }();
+
+                    match file_result {
+                        Ok(_) => {}
+                        Err(error) => {
+                            logger.log(LogLevel::Error, error);
+                        }
+                    }
                 }
             }
         });
     });
 
-    tasks.join_all().await;
-
-    //Now for each source in sources we need to:
-    //   if is FILE
-    //       if is HTML
-    //           sanitize html
-    //       if is Asset
-    //           sanitize asset
-    //   if is URL
-    //       fetch it safely
-    //       if is HTML
-    //           sanitize html
-    //       if is Asset
-    //           sanitize asset
-
-    // Ensure output directory exists
-    fs::create_dir_all(&args.output_dir)
-        .with_context(|| format!("Failed to create output directory: {:?}", args.output_dir))?;
-
-    println!(
-        "Successfully created output directory: {:?}",
-        args.output_dir
-    );
+    drop(pool); // This blocks until all jobs are executed
 
     Ok(())
 }

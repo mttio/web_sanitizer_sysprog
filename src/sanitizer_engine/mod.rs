@@ -1,3 +1,4 @@
+pub mod concurrency;
 pub mod engine_structs;
 pub mod errors;
 pub mod html;
