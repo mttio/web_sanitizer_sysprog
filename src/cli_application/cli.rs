@@ -45,14 +45,9 @@ pub struct Args {
     pub verbose: bool,
 }
 
-/// Run the CLI application
-pub async fn run() -> Result<()> {
-    let args = Args::parse();
-
-    println!("Successfully parsed args: {:?}", args);
-
-    // Load policy
-    let policy = match &args.policy {
+/// Helper to load the sanitization policy
+fn load_policy(path: Option<&PathBuf>) -> Result<Policy> {
+    let policy = match path {
         Some(path) => {
             let content = fs::read_to_string(path)
                 .with_context(|| format!("Failed to read policy file: {path:?}"))?;
@@ -60,18 +55,13 @@ pub async fn run() -> Result<()> {
         }
         None => Policy::default(),
     };
+    Ok(policy)
+}
 
-    // println!("Successfully loaded policy: {policy:#?}");
-
-    // let subscriber = FmtSubscriber::builder()
-    //     .with_max_level(Level::TRACE)
-    //     .finish();
-
-    // tracing::subscriber::set_global_default(subscriber)?;
-
-    // Prepare inputs
+/// Helper to parse input patterns into concrete InputSources
+fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
     let mut sources = Vec::new();
-    for input in args.inputs {
+    for input in inputs {
         // Try to parse as URL first
         if let Ok(url) = Url::parse(&input)
             && (url.scheme() == "http" || url.scheme() == "https")
@@ -101,30 +91,120 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+    Ok(sources)
+}
 
-    // No-sources case
+/// Helper to fetch and sanitize a URL source
+fn process_url(
+    url: Url,
+    index: usize,
+    client: &SanitizerHttpClient,
+    policy: &Policy,
+    logger: &Logger,
+    rt_handle: &tokio::runtime::Handle,
+    output_dir: &PathBuf,
+) {
+    if let Some(original) = check_domain(&url)
+        && let Err(e) = policy.urls.idn_action.handle_error(logger, IDN(original))
+    {
+        logger.error(e);
+        return;
+    }
+
+    if let Some(host) = url.host().map(|x| x.to_owned())
+        && policy
+            .urls
+            .dangerous_domains
+            .iter()
+            .any(|x| host.matches(&x.0))
+        && let Err(e) = policy
+            .connections
+            .dangerous_domain_action
+            .handle_error(logger, DangerousDomain(host.to_owned()))
+    {
+        logger.error(e);
+        return;
+    }
+
+    let output_path = output_dir.join(format!("{index}.html"));
+    let output = match File::create(&output_path) {
+        Ok(file) => file,
+        Err(e) => {
+            logger.error(anyhow!("Failed to create output file {:?}: {}", output_path, e));
+            return;
+        }
+    };
+
+    let fetch_result = rt_handle.block_on(async {
+        client.fetch_one_url(&url, logger, output, policy).await
+    });
+
+    if let Err(error) = fetch_result {
+        logger.error(anyhow!("Could not fetch url {}: {}", url, error));
+    }
+}
+
+/// Helper to process and sanitize a local file
+fn process_file(
+    path: PathBuf,
+    index: usize,
+    policy: &Policy,
+    logger: &Logger,
+    output_dir: &PathBuf,
+) {
+    let output_path = output_dir.join(format!("{index}.html"));
+    let file_result = || -> Result<()> {
+        let input_file = File::open(&path)
+            .with_context(|| format!("Failed to open local file {:?}", path))?;
+        let mut reader = BufReader::new(input_file);
+        let output_file = File::create(&output_path)
+            .with_context(|| format!("Failed to create output file {:?}", output_path))?;
+        
+        let mut rewriter = create_rewriter(logger, policy, output_file);
+        let mut buffer = [0; 8192];
+        loop {
+            let n = reader.read(&mut buffer)
+                .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
+            if n == 0 {
+                break;
+            }
+            rewriter.write(&buffer[..n])
+                .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
+        }
+        rewriter.end()
+            .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
+        Ok(())
+    }();
+
+    if let Err(error) = file_result {
+        logger.log(LogLevel::Error, error);
+    }
+}
+
+/// Run the CLI application
+pub async fn run() -> Result<()> {
+    let args = Args::parse();
+    println!("Successfully parsed args: {:?}", args);
+
+    let policy = load_policy(args.policy.as_ref())?;
+    let sources = parse_inputs(args.inputs)?;
+
     if sources.is_empty() {
         println!("No valid inputs provided.");
         return Ok(());
     }
 
-    // println!("Successfully created input sources vector: {:?}", sources);
-
     // Ensure output directory exists
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("Failed to create output directory: {:?}", args.output_dir))?;
 
-    println!(
-        "Successfully created output directory: {:?}",
-        args.output_dir
-    );
+    println!("Successfully created output directory: {:?}", args.output_dir);
 
-    let client = SanitizerHttpClient::new(&policy).await?;
-    let client = Arc::new(client);
+    let client = Arc::new(SanitizerHttpClient::new(&policy).await?);
     let policy = Arc::new(policy);
     let max_size = (sources.len() as f64).log10().ceil() as usize;
 
-    let pool = ThreadPool::new(args.workers); //thread pool is created with args.workers ready to work
+    let pool = ThreadPool::new(args.workers); 
     let rt_handle = tokio::runtime::Handle::current();
     let output_dir = Arc::new(args.output_dir);
 
@@ -139,83 +219,12 @@ pub async fn run() -> Result<()> {
         let rt_handle = rt_handle.clone();
         let output_dir = Arc::clone(&output_dir);
 
-        pool.push_job(move || {
-            match source {
-                InputSource::Url(url) => {
-                    if let Some(original) = check_domain(&url)
-                        && let Err(e) = policy.urls.idn_action.handle_error(&logger, IDN(original))
-                    {
-                        logger.error(e);
-                        return;
-                    }
-
-                    if let Some(host) = url.host().map(|x| x.to_owned())
-                        && policy
-                            .urls
-                            .dangerous_domains
-                            .iter()
-                            .any(|x| host.matches(&x.0))
-                        && let Err(e) = policy
-                            .connections
-                            .dangerous_domain_action
-                            .handle_error(&logger, DangerousDomain(host.to_owned()))
-                    {
-                        logger.error(e);
-                        return;
-                    }
-
-                    let output_path = output_dir.join(format!("{i}.html"));
-                    let output = match File::create(&output_path) {
-                        Ok(file) => file,
-                        Err(e) => {
-                            logger.error(anyhow!("Failed to create output file {:?}: {}", output_path, e));
-                            return;
-                        }
-                    };
-
-                    let fetch_result = rt_handle.block_on(async {
-                        client.fetch_one_url(&url, &logger, output, &policy).await
-                    });
-
-                    match fetch_result {
-                        Ok(_) => {}
-                        Err(error) => {
-                            logger.log(LogLevel::Error, anyhow!("Could not fetch url {}: {}", url, error));
-                        }
-                    }
-                }
-                InputSource::File(path) => {
-                    let output_path = output_dir.join(format!("{i}.html"));
-                    let file_result = || -> Result<()> {
-                        let input_file = File::open(&path)
-                            .with_context(|| format!("Failed to open local file {:?}", path))?;
-                        let mut reader = BufReader::new(input_file);
-                        let output_file = File::create(&output_path)
-                            .with_context(|| format!("Failed to create output file {:?}", output_path))?;
-                        
-                        let mut rewriter = create_rewriter(&logger, &policy, output_file);
-                        let mut buffer = [0; 8192];
-                        loop {
-                            let n = reader.read(&mut buffer)
-                                .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
-                            if n == 0 {
-                                break;
-                            }
-                            rewriter.write(&buffer[..n])
-                                .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
-                        }
-                        rewriter.end()
-                            .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
-                        Ok(())
-                    }();
-
-                    match file_result {
-                        Ok(_) => {}
-                        Err(error) => {
-                            logger.log(LogLevel::Error, error);
-                        }
-                    }
-                }
+        pool.push_job(move || match source {
+            InputSource::Url(url) => {
+                process_url(url, i, &client, &policy, &logger, &rt_handle, &output_dir);
+            }
+            InputSource::File(path) => {
+                process_file(path, i, &policy, &logger, &output_dir);
             }
         });
     });
@@ -224,6 +233,15 @@ pub async fn run() -> Result<()> {
 
     Ok(())
 }
+
+
+
+
+
+
+
+
+
 
 /*======================== HELPERS ============================*/
 
@@ -234,6 +252,11 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
         .map(|s| s.starts_with('.'))
         .unwrap_or(false)
 }
+
+
+
+
+
 
 /*======================== TESTS ============================*/
 
