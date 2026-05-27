@@ -1,13 +1,21 @@
 use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource};
+use crate::sanitizer_engine::errors::{ContentTooLong, DangerousDomain, IDN, TooManyRedirects};
+use crate::sanitizer_engine::html::create_rewriter;
+use crate::sanitizer_engine::log::Logger;
 use crate::sanitizer_engine::policy::Policy;
-use anyhow::{anyhow, Context, Result};
-use hickory_resolver::TokioResolver;
-use reqwest::{Client, redirect, header};
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use crate::sanitizer_engine::url::{RuleMatch, check_domain};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use std::time::Duration;
+use hickory_resolver::TokioResolver;
+use itertools::Itertools;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::{Client, header, redirect};
+use std::fs::File;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use url::Url;
 
 /*================== HELPERS ===================*/
 
@@ -25,10 +33,7 @@ fn is_safe_ip(ip: IpAddr) -> bool {
                 && !is_v4_reserved(v4)
         }
         IpAddr::V6(v6) => {
-            !v6.is_loopback()
-                && !is_v6_private(v6)
-                && !v6.is_multicast()
-                && !v6.is_unspecified()
+            !v6.is_loopback() && !is_v6_private(v6) && !v6.is_multicast() && !v6.is_unspecified()
         }
     }
 }
@@ -46,7 +51,7 @@ fn is_v4_reserved(v4: Ipv4Addr) -> bool {
     (o[0] == 192 && o[1] == 0   && o[2] == 2)   ||   // 192.0.2.0/24    TEST-NET-1
     (o[0] == 198 && o[1] == 51  && o[2] == 100)  ||  // 198.51.100.0/24 TEST-NET-2
     (o[0] == 203 && o[1] == 0   && o[2] == 113)  ||  // 203.0.113.0/24  TEST-NET-3
-    o[0] >= 240                                      // 240.0.0.0/4     Reserved
+    o[0] >= 240 // 240.0.0.0/4     Reserved
 }
 
 /// Returns true if the IPv6 address is in a private/local range
@@ -98,9 +103,7 @@ impl Resolve for SsrfSafeDnsResolver {
                 .collect();
 
             if safe_addrs.is_empty() {
-                return Err(
-                    format!("No safe IP addresses found for host: {}", host).into()
-                );
+                return Err(format!("No safe IP addresses found for host: {}", host).into());
             }
 
             Ok(Box::new(safe_addrs.into_iter()) as Addrs)
@@ -116,7 +119,6 @@ pub struct SanitizerHttpClient {
 }
 
 impl SanitizerHttpClient {
-
     /// Creates a new SanitizerHttpClient instance
     pub async fn new(policy: &Policy) -> Result<Self> {
         let resolver = TokioResolver::builder_tokio()
@@ -127,16 +129,60 @@ impl SanitizerHttpClient {
         let ssrf_safe_resolver = SsrfSafeDnsResolver {
             inner: Arc::new(resolver),
             // Reuse the connection timeout for DNS. This avoids an extra policy field
-            timeout: policy.timeouts.connection_timeout,
+            timeout: policy.connections.connection_timeout,
+        };
+
+        let max_redirects = policy.connections.max_redirects;
+        let max_redirects_action = policy.connections.max_redirects_action;
+        let dangerous_hosts = policy
+            .urls
+            .dangerous_domains
+            .iter()
+            .map(|x| x.0.clone())
+            .collect_vec();
+        let dangerous_domain_action = policy.connections.dangerous_domain_action;
+        let idn_action = policy.urls.idn_action;
+
+        let logger = Logger {
+            path: Arc::new(PathBuf::new()),
+            index: 0,
+            max_size: 1,
         };
 
         let client = Client::builder()
             // Set custom Ip resolver
             .dns_resolver(Arc::new(ssrf_safe_resolver))
-            .connect_timeout(policy.timeouts.connection_timeout)
-            .timeout(policy.timeouts.overall_timeout)
+            .connect_timeout(policy.connections.connection_timeout)
+            .timeout(policy.connections.overall_timeout)
+            .user_agent(&policy.connections.user_agent)
             // Disable redirects
-            .redirect(redirect::Policy::none())
+            .redirect(redirect::Policy::custom(move |attempt| {
+                let check = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    if let Some(original) = check_domain(attempt.url()) {
+                        idn_action.handle_error(&logger, IDN(original))?;
+                    }
+
+                    if let Some(max_redirects) = max_redirects
+                        && attempt.previous().len() == max_redirects + 1
+                    {
+                        max_redirects_action.handle_error(&logger, TooManyRedirects)?;
+                    }
+
+                    if let Some(host) = attempt.url().host().map(|x| x.to_owned())
+                        && dangerous_hosts.iter().any(|x| host.matches(x))
+                    {
+                        dangerous_domain_action
+                            .handle_error(&logger, DangerousDomain(host.to_owned()))?;
+                    }
+
+                    Ok(())
+                };
+
+                match check() {
+                    Ok(_) => attempt.follow(),
+                    Err(e) => attempt.error(e),
+                }
+            }))
             // Enforce TLS 1.2+
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .build()
@@ -146,21 +192,42 @@ impl SanitizerHttpClient {
     }
 
     /// Fetch a single URL with security controls
-    pub async fn fetch_one_url(&self, url: &url::Url, policy: &Policy) -> Result<FetchedContent> {
-
+    pub async fn fetch_one_url(
+        &self,
+        url: &Url,
+        logger: &Logger,
+        output: File,
+        policy: &Policy,
+    ) -> Result<FetchedContent> {
         if url.scheme() != "https" {
             return Err(anyhow!("Only HTTPS URLs are permitted"));
         }
 
-
-        let response = self.client
+        let response = self
+            .client
             .get(url.clone())
             .send()
             .await
             .with_context(|| format!("Request failed for URL: {}", url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("Server returned error status: {}", response.status()));
+            return Err(anyhow!(
+                "Server returned error status: {}",
+                response.status()
+            ));
+        }
+
+        let max_bytes = policy.resources.max_bytes;
+
+        // Fast-fail for `Content-Length` header
+        if let Some(length) = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|x| x.to_str().ok())
+            .and_then(|x| x.parse::<usize>().ok())
+            && length > max_bytes
+        {
+            return Err(ContentTooLong(max_bytes).into());
         }
 
         let content_type = response
@@ -171,23 +238,26 @@ impl SanitizerHttpClient {
 
         // Stream body with byte limit to prevent memory exhaustion
         let mut stream = response.bytes_stream();
-        let mut data = Vec::new();
-        let max_bytes = policy.resources.max_bytes;
+        let mut length = 0;
+
+        let mut rewriter = create_rewriter(logger, policy, output);
 
         while let Some(item) = stream.next().await {
             let chunk = item.context("Error while streaming body")?;
-            if data.len() + chunk.len() > max_bytes {
-                return Err(anyhow!(
-                    "Response body exceeds maximum size limit of {} bytes",
-                    max_bytes
-                ));
+
+            length += chunk.len();
+            if length > max_bytes {
+                return Err(ContentTooLong(max_bytes).into());
             }
-            data.extend_from_slice(&chunk);
+
+            rewriter.write(&chunk)?;
         }
+
+        rewriter.end()?;
 
         Ok(FetchedContent {
             source: InputSource::Url(url.clone()),
-            data,
+            data: Vec::new(),
             content_type,
         })
     }
@@ -206,23 +276,19 @@ pub async fn fetch_multiple_urls(
     let client = SanitizerHttpClient::new(policy).await?;
 
     for input_source in sources {
-        if let InputSource::Url(url) = input_source {
-            match client.fetch_one_url(&url, policy).await {
-                Ok(res) => results_vec.push(res),
-                Err(e) => errors_vec.push(anyhow!("Could not fetch url {:?}: {}", url, e)),
-            }
-        }
+        // if let InputSource::Url(url) = input_source {
+        //     match client.fetch_one_url(&url, policy).await {
+        //         Ok(res) => results_vec.push(res),
+        //         Err(e) => errors_vec.push(anyhow!(
+        //             "Could not fetch url {}: {}",
+        //             url,
+        //             e.source().unwrap().source().unwrap()
+        //         )),
+        //     }
+        // }
     }
     Ok((results_vec, errors_vec))
 }
-
-
-
-
-
-
-
-
 
 /*================== TESTS ===================*/
 
@@ -233,17 +299,17 @@ mod tests {
 
     #[test]
     fn test_is_safe_ip_v4() {
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));    // loopback
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));  // private
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));     // private
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));   // private
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));  // link-local
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));   // CGNAT start
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))); // loopback
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))); // private
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))); // private
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)))); // private
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)))); // link-local
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)))); // CGNAT start
         assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255)))); // CGNAT end
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));    // TEST-NET-1
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))); // TEST-NET-1
         assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)))); // TEST-NET-2
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));  // TEST-NET-3
-        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));    // Reserved
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))); // TEST-NET-3
+        assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)))); // Reserved
         assert!(!is_safe_ip(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)))); // Broadcast
         assert!(is_safe_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(is_safe_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
@@ -251,30 +317,38 @@ mod tests {
 
     #[test]
     fn test_is_safe_ip_v6() {
-        assert!(!is_safe_ip(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))));           // ::1 loopback
-        assert!(!is_safe_ip(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))));      // ULA
-        assert!(!is_safe_ip(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))));      // link-local
-        assert!(is_safe_ip(IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)))); // Google DNS
+        assert!(!is_safe_ip(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0, 0, 1
+        )))); // ::1 loopback
+        assert!(!is_safe_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        )))); // ULA
+        assert!(!is_safe_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        )))); // link-local
+        assert!(is_safe_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
+        )))); // Google DNS
     }
 
     #[test]
     fn test_is_v4_cgnat() {
-        assert!(is_v4_cgnat(Ipv4Addr::new(100, 64, 0, 1)));        // start of range
-        assert!(is_v4_cgnat(Ipv4Addr::new(100, 127, 255, 255)));   // end of range
-        assert!(is_v4_cgnat(Ipv4Addr::new(100, 100, 1, 1)));       // middle of range
-        assert!(!is_v4_cgnat(Ipv4Addr::new(100, 63, 255, 255)));   // just below range
-        assert!(!is_v4_cgnat(Ipv4Addr::new(100, 128, 0, 0)));      // just above range
-        assert!(!is_v4_cgnat(Ipv4Addr::new(8, 8, 8, 8)));          // public
+        assert!(is_v4_cgnat(Ipv4Addr::new(100, 64, 0, 1))); // start of range
+        assert!(is_v4_cgnat(Ipv4Addr::new(100, 127, 255, 255))); // end of range
+        assert!(is_v4_cgnat(Ipv4Addr::new(100, 100, 1, 1))); // middle of range
+        assert!(!is_v4_cgnat(Ipv4Addr::new(100, 63, 255, 255))); // just below range
+        assert!(!is_v4_cgnat(Ipv4Addr::new(100, 128, 0, 0))); // just above range
+        assert!(!is_v4_cgnat(Ipv4Addr::new(8, 8, 8, 8))); // public
     }
 
     #[test]
     fn test_is_v4_reserved() {
-        assert!(is_v4_reserved(Ipv4Addr::new(192, 0, 2, 1)));      // TEST-NET-1
-        assert!(is_v4_reserved(Ipv4Addr::new(198, 51, 100, 1)));   // TEST-NET-2
-        assert!(is_v4_reserved(Ipv4Addr::new(203, 0, 113, 1)));    // TEST-NET-3
-        assert!(is_v4_reserved(Ipv4Addr::new(240, 0, 0, 1)));      // Reserved
+        assert!(is_v4_reserved(Ipv4Addr::new(192, 0, 2, 1))); // TEST-NET-1
+        assert!(is_v4_reserved(Ipv4Addr::new(198, 51, 100, 1))); // TEST-NET-2
+        assert!(is_v4_reserved(Ipv4Addr::new(203, 0, 113, 1))); // TEST-NET-3
+        assert!(is_v4_reserved(Ipv4Addr::new(240, 0, 0, 1))); // Reserved
         assert!(is_v4_reserved(Ipv4Addr::new(255, 255, 255, 255))); // Broadcast
-        assert!(!is_v4_reserved(Ipv4Addr::new(8, 8, 8, 8)));       // public
-        assert!(!is_v4_reserved(Ipv4Addr::new(1, 1, 1, 1)));       // public
+        assert!(!is_v4_reserved(Ipv4Addr::new(8, 8, 8, 8))); // public
+        assert!(!is_v4_reserved(Ipv4Addr::new(1, 1, 1, 1))); // public
     }
 }

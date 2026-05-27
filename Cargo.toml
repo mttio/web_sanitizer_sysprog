@@ -18,6 +18,8 @@ tracing-subscriber = "0.3.23"
 url = { version = "2.5.8", features = ["serde"] }
 walkdir = "2.5.0"
 humantime-serde = "1.1.1"
+colored = "3.1.1"
+lol_html = "2.9.0"
 
 [patch.crates-io]
 form_urlencoded = { git = "https://github.com/psyvern/rust-url.git" }

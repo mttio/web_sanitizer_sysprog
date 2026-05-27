@@ -5,24 +5,32 @@
       "trusted.com"
     ],
     "strip_event_handlers": true,
-    "rewrite_dangerous_uris": true
+    "rewrite_dangerous_uris": true,
+    "dangerous_domain_action": "replace"
   },
   "urls": {
     "dangerous_domains": [
       "malicious-domain.com",
-      "evil.com"
+      "evil.com",
+      "iana.org",
+      "developers.google.com",
+      "com.google.android.youtube"
     ],
-    "dangerous_domain_action": "warn_and_replace",
-    "idn_action": "deny"
+    "idn_action": "warn"
   },
   "resources": {
     "fetch_sub_resources": true,
     "max_depth": 1,
-    "max_bytes": 1048576,
+    "max_bytes": 102400,
+    "max_bytes_action": "warn",
     "max_requests": 5
   },
-  "timeouts": {
+  "connections": {
     "connection_timeout": "3s",
-    "overall_timeout": "15s"
+    "overall_timeout": "15s",
+    "max_redirects": 0,
+    "max_redirects_action": "warn",
+    "user_agent": "CoolBot/0.0 (https://example.org/coolbot/; coolbot@example.org) generic-library/0.0",
+    "dangerous_domain_action": "deny"
   }
 }
