@@ -6,11 +6,14 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 use crate::cli_application::http_client::SanitizerHttpClient;
 use crate::sanitizer_engine::concurrency::ThreadPool;
 use crate::sanitizer_engine::engine_structs::InputSource;
-use crate::sanitizer_engine::errors::{DangerousDomain, IDN};
-use crate::sanitizer_engine::html::create_rewriter;
+use crate::sanitizer_engine::errors::{DangerousDomain, IDN, ContentTooLong};
+use crate::sanitizer_engine::html::{create_rewriter, create_rewriter_with_crawler};
 use crate::sanitizer_engine::log::{LogLevel, Logger};
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
+use crate::sanitizer_engine::resource_sanitizer::validate_mime;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Mutex;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde_json;
@@ -45,7 +48,13 @@ pub struct Args {
     pub verbose: bool,
 }
 
-/// Helper to load the sanitization policy
+/// Helper to load the sanitization policy from a JSON file.
+///
+/// # Inputs
+/// * `path` - Optional path reference to the JSON policy file.
+///
+/// # Returns
+/// * `Result<Policy>` - The parsed `Policy` struct, or the default Policy if no path is given. Returns an error if reading or parsing fails.
 fn load_policy(path: Option<&PathBuf>) -> Result<Policy> {
     let policy = match path {
         Some(path) => {
@@ -58,7 +67,13 @@ fn load_policy(path: Option<&PathBuf>) -> Result<Policy> {
     Ok(policy)
 }
 
-/// Helper to parse input patterns into concrete InputSources
+/// Helper to parse input patterns (URLs, directory paths, or files) into concrete InputSources.
+///
+/// # Inputs
+/// * `inputs` - A vector of input strings.
+///
+/// # Returns
+/// * `Result<Vec<InputSource>>` - A list of successfully parsed input sources (files and URLs).
 fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
     let mut sources = Vec::new();
     for input in inputs {
@@ -94,7 +109,19 @@ fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
     Ok(sources)
 }
 
-/// Helper to fetch and sanitize a URL source
+/// Helper to fetch and sanitize a URL source, crawling its sub-resources recursively.
+///
+/// # Inputs
+/// * `url` - The remote URL to sanitize.
+/// * `index` - The worker/input index for file naming.
+/// * `client` - The HTTP sanitizer client.
+/// * `policy` - The security policy configuration.
+/// * `logger` - The logging interface.
+/// * `rt_handle` - The Tokio runtime handle to block on async tasks.
+/// * `output_dir` - The path to the directory where results are written.
+///
+/// # Returns
+/// * None
 fn process_url(
     url: Url,
     index: usize,
@@ -127,16 +154,8 @@ fn process_url(
     }
 
     let output_path = output_dir.join(format!("{index}.html"));
-    let output = match File::create(&output_path) {
-        Ok(file) => file,
-        Err(e) => {
-            logger.error(anyhow!("Failed to create output file {:?}: {}", output_path, e));
-            return;
-        }
-    };
-
     let fetch_result = rt_handle.block_on(async {
-        client.fetch_one_url(&url, logger, output, policy).await
+        client.fetch_and_crawl(&url, logger, &output_path, policy).await
     });
 
     if let Err(error) = fetch_result {
@@ -144,15 +163,31 @@ fn process_url(
     }
 }
 
-/// Helper to process and sanitize a local file
+/// Helper to process and sanitize a local file, downloading and sanitizing its remote sub-resources if configured.
+///
+/// # Inputs
+/// * `path` - The local file path to process.
+/// * `index` - The worker/input index for file naming.
+/// * `client` - The HTTP sanitizer client used to fetch remote sub-resources.
+/// * `policy` - The security policy configuration.
+/// * `logger` - The logging interface.
+/// * `rt_handle` - The Tokio runtime handle to block on async tasks.
+/// * `output_dir` - The path to the directory where results are written.
+///
+/// # Returns
+/// * None
 fn process_file(
     path: PathBuf,
     index: usize,
+    client: &SanitizerHttpClient,
     policy: &Policy,
     logger: &Logger,
+    rt_handle: &tokio::runtime::Handle,
     output_dir: &PathBuf,
 ) {
     let output_path = output_dir.join(format!("{index}.html"));
+    let sub_resources = Arc::new(Mutex::new(Vec::new()));
+
     let file_result = || -> Result<()> {
         let input_file = File::open(&path)
             .with_context(|| format!("Failed to open local file {:?}", path))?;
@@ -160,28 +195,169 @@ fn process_file(
         let output_file = File::create(&output_path)
             .with_context(|| format!("Failed to create output file {:?}", output_path))?;
         
-        let mut rewriter = create_rewriter(logger, policy, output_file);
-        let mut buffer = [0; 8192];
-        loop {
-            let n = reader.read(&mut buffer)
-                .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
-            if n == 0 {
-                break;
+        if policy.resources.fetch_sub_resources {
+            let dummy_base = Arc::new(Mutex::new(Url::parse("https://localhost/").unwrap()));
+            let mut rewriter = create_rewriter_with_crawler(
+                logger,
+                policy,
+                dummy_base,
+                Arc::clone(&sub_resources),
+                output_file,
+            );
+            let mut buffer = [0; 8192];
+            loop {
+                let n = reader.read(&mut buffer)
+                    .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
+                if n == 0 {
+                    break;
+                }
+                rewriter.write(&buffer[..n])
+                    .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
             }
-            rewriter.write(&buffer[..n])
-                .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
+            rewriter.end()
+                .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
+        } else {
+            let mut rewriter = create_rewriter(logger, policy, output_file);
+            let mut buffer = [0; 8192];
+            loop {
+                let n = reader.read(&mut buffer)
+                    .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
+                if n == 0 {
+                    break;
+                }
+                rewriter.write(&buffer[..n])
+                    .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
+            }
+            rewriter.end()
+                .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
         }
-        rewriter.end()
-            .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
         Ok(())
     }();
 
     if let Err(error) = file_result {
         logger.log(LogLevel::Error, error);
+        return;
+    }
+
+    // Crawl discovered sub-resources
+    let discovered = {
+        let guard = sub_resources.lock().unwrap();
+        guard.clone()
+    };
+
+    if !discovered.is_empty() {
+        let max_requests = policy.resources.max_requests;
+        let max_bytes = policy.resources.max_bytes;
+        let max_bytes_action = policy.resources.max_bytes_action;
+        let max_depth = policy.resources.max_depth;
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut total_requests = 0;
+        let mut total_bytes = 0;
+
+        for (sub_url, local_name) in discovered {
+            queue.push_back((sub_url, local_name, 1));
+        }
+
+        rt_handle.block_on(async {
+            while let Some((url, local_name, depth)) = queue.pop_front() {
+                if depth > max_depth {
+                    continue;
+                }
+                if visited.contains(&url) {
+                    continue;
+                }
+                if total_requests >= max_requests {
+                    logger.warn(anyhow!("Sub-resource crawl limit reached: max_requests = {}", max_requests));
+                    break;
+                }
+
+                total_requests += 1;
+                let remaining_bytes = max_bytes.saturating_sub(total_bytes);
+                if remaining_bytes == 0 {
+                    let err = ContentTooLong(max_bytes);
+                    let _ = max_bytes_action.handle_error(logger, err);
+                    break;
+                }
+
+                logger.info(anyhow!("Crawling local file sub-resource (depth {}): {}", depth, url));
+
+                let fetch_res = client.fetch_raw(&url, logger, policy, remaining_bytes).await;
+                let fetched = match fetch_res {
+                    Ok(f) => f,
+                    Err(e) => {
+                        logger.warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
+                        if total_bytes + remaining_bytes >= max_bytes {
+                            let err = ContentTooLong(max_bytes);
+                            let _ = max_bytes_action.handle_error(logger, err);
+                        }
+                        continue;
+                    }
+                };
+
+                total_bytes += fetched.data.len();
+                visited.insert(url.clone());
+
+                let decl_type = fetched.content_type.as_deref();
+                if let Err(mime_err) = validate_mime(decl_type, &fetched.data) {
+                    logger.warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
+                    continue;
+                }
+
+                use crate::sanitizer_engine::resource_sanitizer::{sniff_mime, strip_jpeg_metadata, strip_png_metadata, sanitize_css, sanitize_javascript};
+
+                let sniffed = sniff_mime(&fetched.data).unwrap_or(decl_type.unwrap_or(""));
+                let is_jpeg = sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
+                let is_png = sniffed == "image/png" || url.path().ends_with(".png");
+                let is_css = sniffed == "text/css" || url.path().ends_with(".css");
+                let is_js = sniffed == "text/javascript" || sniffed == "application/javascript" || url.path().ends_with(".js");
+
+                let sanitized_data = if is_jpeg {
+                    strip_jpeg_metadata(&fetched.data)
+                } else if is_png {
+                    strip_png_metadata(&fetched.data)
+                } else if is_css {
+                    let css_str = String::from_utf8_lossy(&fetched.data);
+                    let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
+                    if depth + 1 <= max_depth {
+                        for (n_url, n_local) in nested_urls {
+                            if !visited.contains(&n_url) {
+                                queue.push_back((n_url, n_local, depth + 1));
+                            }
+                        }
+                    }
+                    sanitized_css.into_bytes()
+                } else if is_js {
+                    let js_str = String::from_utf8_lossy(&fetched.data);
+                    match sanitize_javascript(&js_str) {
+                        Ok(clean_js) => clean_js.into_bytes(),
+                        Err(js_err) => {
+                            logger.warn(anyhow!("JS validation failed for {}: {}", url, js_err));
+                            b"/* Blocked by Web Sanitizer: dangerous keywords found */".to_vec()
+                        }
+                    }
+                } else {
+                    fetched.data.clone()
+                };
+
+                let sub_path = output_dir.join(&local_name);
+                if let Err(e) = fs::write(&sub_path, &sanitized_data) {
+                    logger.error(anyhow!("Failed to write sub-resource to {:?}: {}", sub_path, e));
+                }
+            }
+        });
     }
 }
 
-/// Run the CLI application
+
+/// Runs the main CLI application workflow: parses args, loads policy, submits jobs to the thread pool, and blocks until completion.
+///
+/// # Inputs
+/// * None (inputs are gathered from command line arguments via `Args::parse()`).
+///
+/// # Returns
+/// * `Result<()>` - `Ok(())` on successful completion, or an error if initialization fails.
 pub async fn run() -> Result<()> {
     let args = Args::parse();
     println!("Successfully parsed args: {:?}", args);
@@ -224,7 +400,7 @@ pub async fn run() -> Result<()> {
                 process_url(url, i, &client, &policy, &logger, &rt_handle, &output_dir);
             }
             InputSource::File(path) => {
-                process_file(path, i, &policy, &logger, &output_dir);
+                process_file(path, i, &client, &policy, &logger, &rt_handle, &output_dir);
             }
         });
     });
@@ -243,8 +419,14 @@ pub async fn run() -> Result<()> {
 
 
 
-/*======================== HELPERS ============================*/
-
+/// Helper to determine if a directory entry starts with a dot (hidden file/folder).
+///
+/// # Inputs
+/// * `entry` - A reference to the walkdir entry.
+///
+/// # Returns
+/// * `bool` - `true` if the entry name starts with a dot, otherwise `false`.
+#[allow(dead_code)]
 fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()
