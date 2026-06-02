@@ -1,6 +1,6 @@
 use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource};
 use crate::sanitizer_engine::errors::{ContentTooLong, DangerousDomain, IDN, TooManyRedirects};
-use crate::sanitizer_engine::html::{create_rewriter, create_rewriter_with_crawler};
+use crate::sanitizer_engine::html::create_rewriter;
 use crate::sanitizer_engine::resource_sanitizer::{
     sniff_mime, validate_mime, sanitize_javascript, sanitize_css,
     strip_jpeg_metadata, strip_png_metadata,
@@ -294,7 +294,7 @@ impl SanitizerHttpClient {
         let mut stream = response.bytes_stream();
         let mut length = 0;
 
-        let mut rewriter = create_rewriter(logger, policy, output);
+        let mut rewriter = create_rewriter(logger, policy, None, output);
 
         while let Some(item) = stream.next().await {
             let chunk = item.context("Error while streaming body")?;
@@ -462,60 +462,42 @@ impl SanitizerHttpClient {
 
         let mut stream = response.bytes_stream();
         
-        if is_html && policy.resources.fetch_sub_resources {
+        let crawler_state = if is_html && policy.resources.fetch_sub_resources {
             let base_url = Arc::new(Mutex::new(root_url.clone()));
             let sub_resources = Arc::new(Mutex::new(Vec::new()));
-            
-            let file = File::create(output_path)?;
-            let mut rewriter = create_rewriter_with_crawler(
-                logger,
-                policy,
-                Arc::clone(&base_url),
-                Arc::clone(&sub_resources),
-                file,
-            );
+            Some((base_url, sub_resources))
+        } else {
+            None
+        };
 
-            while let Some(item) = stream.next().await {
-                let chunk = item.context("Error while streaming HTML body")?;
-                total_bytes += chunk.len();
-                
-                if total_bytes > max_bytes {
-                    let err = ContentTooLong(max_bytes);
-                    if let Err(e) = max_bytes_action.handle_error(logger, err) {
-                        return Err(e.into());
-                    }
-                    break;
+        let file = File::create(output_path)?;
+        let mut rewriter = create_rewriter(logger, policy, crawler_state.clone(), file);
+
+        while let Some(item) = stream.next().await {
+            let chunk = item.context("Error while streaming body")?;
+            total_bytes += chunk.len();
+            
+            if total_bytes > max_bytes {
+                let err = ContentTooLong(max_bytes);
+                if let Err(e) = max_bytes_action.handle_error(logger, err) {
+                    return Err(e.into());
                 }
-                
-                rewriter.write(&chunk)?;
+                break;
             }
             
-            let _ = rewriter.end();
+            rewriter.write(&chunk)?;
+        }
+        
+        let _ = rewriter.end();
 
-            // Populate the queue from the discovered sub-resources
+        // Populate the queue from the discovered sub-resources
+        if let Some((_, sub_resources)) = crawler_state {
             let discovered = sub_resources.lock().unwrap();
             for (sub_url, local_name) in discovered.iter() {
                 if !visited.contains(sub_url) {
                     queue.push_back((sub_url.clone(), local_name.clone(), 1));
                 }
             }
-        } else {
-            // Write raw content (either not HTML or sub-resource crawling is disabled)
-            let file = File::create(output_path)?;
-            let mut writer = create_rewriter(logger, policy, file);
-            while let Some(item) = stream.next().await {
-                let chunk = item.context("Error while streaming body")?;
-                total_bytes += chunk.len();
-                if total_bytes > max_bytes {
-                    let err = ContentTooLong(max_bytes);
-                    if let Err(e) = max_bytes_action.handle_error(logger, err) {
-                        return Err(e.into());
-                    }
-                    break;
-                }
-                writer.write(&chunk)?;
-            }
-            let _ = writer.end();
         }
 
         // 3. Recursive crawler loop

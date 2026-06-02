@@ -7,7 +7,7 @@ use crate::cli_application::http_client::SanitizerHttpClient;
 use crate::sanitizer_engine::concurrency::ThreadPool;
 use crate::sanitizer_engine::engine_structs::InputSource;
 use crate::sanitizer_engine::errors::{DangerousDomain, IDN, ContentTooLong};
-use crate::sanitizer_engine::html::{create_rewriter, create_rewriter_with_crawler};
+use crate::sanitizer_engine::html::create_rewriter;
 use crate::sanitizer_engine::log::{LogLevel, Logger};
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
@@ -195,42 +195,26 @@ fn process_file(
         let output_file = File::create(&output_path)
             .with_context(|| format!("Failed to create output file {:?}", output_path))?;
         
-        if policy.resources.fetch_sub_resources {
+        let crawler_state = if policy.resources.fetch_sub_resources {
             let dummy_base = Arc::new(Mutex::new(Url::parse("https://localhost/").unwrap()));
-            let mut rewriter = create_rewriter_with_crawler(
-                logger,
-                policy,
-                dummy_base,
-                Arc::clone(&sub_resources),
-                output_file,
-            );
-            let mut buffer = [0; 8192];
-            loop {
-                let n = reader.read(&mut buffer)
-                    .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
-                if n == 0 {
-                    break;
-                }
-                rewriter.write(&buffer[..n])
-                    .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
-            }
-            rewriter.end()
-                .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
+            Some((dummy_base, Arc::clone(&sub_resources)))
         } else {
-            let mut rewriter = create_rewriter(logger, policy, output_file);
-            let mut buffer = [0; 8192];
-            loop {
-                let n = reader.read(&mut buffer)
-                    .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
-                if n == 0 {
-                    break;
-                }
-                rewriter.write(&buffer[..n])
-                    .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
+            None
+        };
+
+        let mut rewriter = create_rewriter(logger, policy, crawler_state, output_file);
+        let mut buffer = [0; 8192];
+        loop {
+            let n = reader.read(&mut buffer)
+                .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
+            if n == 0 {
+                break;
             }
-            rewriter.end()
-                .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
+            rewriter.write(&buffer[..n])
+                .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
         }
+        rewriter.end()
+            .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
         Ok(())
     }();
 
