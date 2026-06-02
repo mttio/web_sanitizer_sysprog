@@ -11,16 +11,19 @@ use crate::sanitizer_engine::html::create_rewriter;
 use crate::sanitizer_engine::log::{LogLevel, Logger};
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
-use crate::sanitizer_engine::resource_sanitizer::validate_mime;
-use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
+use crate::sanitizer_engine::resource_sanitizer::{
+    validate_mime, sniff_mime, strip_jpeg_metadata, strip_png_metadata, sanitize_css, sanitize_javascript,
+};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, Condvar};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde_json;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs;
+use std::io::{Read, BufReader};
+use std::fs::File;
+
 use std::path::PathBuf;
-use std::sync::Arc;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -109,83 +112,84 @@ fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
     Ok(sources)
 }
 
-/// Helper to fetch and sanitize a URL source, crawling its sub-resources recursively.
-///
-/// # Inputs
-/// * `url` - The remote URL to sanitize.
-/// * `index` - The worker/input index for file naming.
-/// * `client` - The HTTP sanitizer client.
-/// * `policy` - The security policy configuration.
-/// * `logger` - The logging interface.
-/// * `rt_handle` - The Tokio runtime handle to block on async tasks.
-/// * `output_dir` - The path to the directory where results are written.
-///
-/// # Returns
-/// * None
-fn process_url(
-    url: Url,
-    index: usize,
-    client: &SanitizerHttpClient,
-    policy: &Policy,
-    logger: &Logger,
-    rt_handle: &tokio::runtime::Handle,
-    output_dir: &PathBuf,
-) {
-    if let Some(original) = check_domain(&url)
-        && let Err(e) = policy.urls.idn_action.handle_error(logger, IDN(original))
-    {
-        logger.error(e);
-        return;
+/// Context tracking session progress, limits, and state for a single crawl/sanitization workflow.
+pub struct CrawlSession {
+    pub client: Arc<SanitizerHttpClient>,
+    pub policy: Arc<Policy>,
+    pub logger: Logger,
+    pub rt_handle: tokio::runtime::Handle,
+    pub output_dir: Arc<PathBuf>,
+    pub visited: Mutex<HashSet<Url>>,
+    pub total_requests: Mutex<usize>,
+    pub total_bytes: Mutex<usize>,
+    pub active_tasks: Mutex<usize>,
+    pub active_cond: Condvar,
+    pub pool: Arc<ThreadPool>,
+}
+
+impl CrawlSession {
+    pub fn new(
+        client: Arc<SanitizerHttpClient>,
+        policy: Arc<Policy>,
+        logger: Logger,
+        rt_handle: tokio::runtime::Handle,
+        output_dir: Arc<PathBuf>,
+        pool: Arc<ThreadPool>,
+    ) -> Self {
+        Self {
+            client,
+            policy,
+            logger,
+            rt_handle,
+            output_dir,
+            visited: Mutex::new(HashSet::new()),
+            total_requests: Mutex::new(0),
+            total_bytes: Mutex::new(0),
+            active_tasks: Mutex::new(0),
+            active_cond: Condvar::new(),
+            pool,
+        }
     }
 
-    if let Some(host) = url.host().map(|x| x.to_owned())
-        && policy
-            .urls
-            .dangerous_domains
-            .iter()
-            .any(|x| host.matches(&x.0))
-        && let Err(e) = policy
-            .connections
-            .dangerous_domain_action
-            .handle_error(logger, DangerousDomain(host.to_owned()))
+    /// Enqueues a task to the ThreadPool under the context of this CrawlSession, incrementing the active task counter.
+    /// Decrements the counter and notifies the condvar once the job concludes.
+    pub fn enqueue_task<F>(self: &Arc<Self>, f: F)
+    where
+        F: FnOnce(Arc<Self>) + Send + 'static,
     {
-        logger.error(e);
-        return;
+        {
+            let mut count = self.active_tasks.lock().unwrap();
+            *count += 1;
+        }
+
+        let session = Arc::clone(self);
+        self.pool.push_job(move || {
+            f(Arc::clone(&session));
+
+            let mut count = session.active_tasks.lock().unwrap();
+            *count -= 1;
+            if *count == 0 {
+                session.active_cond.notify_all();
+            }
+        });
     }
 
-    let output_path = output_dir.join(format!("{index}.html"));
-    let fetch_result = rt_handle.block_on(async {
-        client.fetch_and_crawl(&url, logger, &output_path, policy).await
-    });
-
-    if let Err(error) = fetch_result {
-        logger.error(anyhow!("Could not fetch url {}: {}", url, error));
+    /// Blocks the current thread until the active task count for this CrawlSession drops to 0.
+    pub fn wait_until_done(&self) {
+        let mut count = self.active_tasks.lock().unwrap();
+        while *count > 0 {
+            count = self.active_cond.wait(count).unwrap();
+        }
     }
 }
 
-/// Helper to process and sanitize a local file, downloading and sanitizing its remote sub-resources if configured.
-///
-/// # Inputs
-/// * `path` - The local file path to process.
-/// * `index` - The worker/input index for file naming.
-/// * `client` - The HTTP sanitizer client used to fetch remote sub-resources.
-/// * `policy` - The security policy configuration.
-/// * `logger` - The logging interface.
-/// * `rt_handle` - The Tokio runtime handle to block on async tasks.
-/// * `output_dir` - The path to the directory where results are written.
-///
-/// # Returns
-/// * None
-fn process_file(
+/// Worker task processing a local HTML file. Parses HTML, rewrites links, and enqueues referenced sub-resources.
+fn process_file_task(
+    session: Arc<CrawlSession>,
     path: PathBuf,
     index: usize,
-    client: &SanitizerHttpClient,
-    policy: &Policy,
-    logger: &Logger,
-    rt_handle: &tokio::runtime::Handle,
-    output_dir: &PathBuf,
 ) {
-    let output_path = output_dir.join(format!("{index}.html"));
+    let output_path = session.output_dir.join(format!("{index}.html"));
     let sub_resources = Arc::new(Mutex::new(Vec::new()));
 
     let file_result = || -> Result<()> {
@@ -195,14 +199,14 @@ fn process_file(
         let output_file = File::create(&output_path)
             .with_context(|| format!("Failed to create output file {:?}", output_path))?;
         
-        let crawler_state = if policy.resources.fetch_sub_resources {
+        let crawler_state = if session.policy.resources.fetch_sub_resources {
             let dummy_base = Arc::new(Mutex::new(Url::parse("https://localhost/").unwrap()));
             Some((dummy_base, Arc::clone(&sub_resources)))
         } else {
             None
         };
 
-        let mut rewriter = create_rewriter(logger, policy, crawler_state, output_file);
+        let mut rewriter = create_rewriter(&session.logger, &session.policy, crawler_state, output_file);
         let mut buffer = [0; 8192];
         loop {
             let n = reader.read(&mut buffer)
@@ -219,121 +223,194 @@ fn process_file(
     }();
 
     if let Err(error) = file_result {
-        logger.log(LogLevel::Error, error);
+        session.logger.log(LogLevel::Error, error);
         return;
     }
 
-    // Crawl discovered sub-resources
     let discovered = {
         let guard = sub_resources.lock().unwrap();
         guard.clone()
     };
 
-    if !discovered.is_empty() {
-        let max_requests = policy.resources.max_requests;
-        let max_bytes = policy.resources.max_bytes;
-        let max_bytes_action = policy.resources.max_bytes_action;
-        let max_depth = policy.resources.max_depth;
-
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        let mut total_requests = 0;
-        let mut total_bytes = 0;
-
-        for (sub_url, local_name) in discovered {
-            queue.push_back((sub_url, local_name, 1));
-        }
-
-        rt_handle.block_on(async {
-            while let Some((url, local_name, depth)) = queue.pop_front() {
-                if depth > max_depth {
-                    continue;
-                }
-                if visited.contains(&url) {
-                    continue;
-                }
-                if total_requests >= max_requests {
-                    logger.warn(anyhow!("Sub-resource crawl limit reached: max_requests = {}", max_requests));
-                    break;
-                }
-
-                total_requests += 1;
-                let remaining_bytes = max_bytes.saturating_sub(total_bytes);
-                if remaining_bytes == 0 {
-                    let err = ContentTooLong(max_bytes);
-                    let _ = max_bytes_action.handle_error(logger, err);
-                    break;
-                }
-
-                logger.info(anyhow!("Crawling local file sub-resource (depth {}): {}", depth, url));
-
-                let fetch_res = client.fetch_raw(&url, logger, policy, remaining_bytes).await;
-                let fetched = match fetch_res {
-                    Ok(f) => f,
-                    Err(e) => {
-                        logger.warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
-                        if total_bytes + remaining_bytes >= max_bytes {
-                            let err = ContentTooLong(max_bytes);
-                            let _ = max_bytes_action.handle_error(logger, err);
-                        }
-                        continue;
-                    }
-                };
-
-                total_bytes += fetched.data.len();
-                visited.insert(url.clone());
-
-                let decl_type = fetched.content_type.as_deref();
-                if let Err(mime_err) = validate_mime(decl_type, &fetched.data) {
-                    logger.warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
-                    continue;
-                }
-
-                use crate::sanitizer_engine::resource_sanitizer::{sniff_mime, strip_jpeg_metadata, strip_png_metadata, sanitize_css, sanitize_javascript};
-
-                let sniffed = sniff_mime(&fetched.data).unwrap_or(decl_type.unwrap_or(""));
-                let is_jpeg = sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
-                let is_png = sniffed == "image/png" || url.path().ends_with(".png");
-                let is_css = sniffed == "text/css" || url.path().ends_with(".css");
-                let is_js = sniffed == "text/javascript" || sniffed == "application/javascript" || url.path().ends_with(".js");
-
-                let sanitized_data = if is_jpeg {
-                    strip_jpeg_metadata(&fetched.data)
-                } else if is_png {
-                    strip_png_metadata(&fetched.data)
-                } else if is_css {
-                    let css_str = String::from_utf8_lossy(&fetched.data);
-                    let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
-                    if depth + 1 <= max_depth {
-                        for (n_url, n_local) in nested_urls {
-                            if !visited.contains(&n_url) {
-                                queue.push_back((n_url, n_local, depth + 1));
-                            }
-                        }
-                    }
-                    sanitized_css.into_bytes()
-                } else if is_js {
-                    let js_str = String::from_utf8_lossy(&fetched.data);
-                    match sanitize_javascript(&js_str) {
-                        Ok(clean_js) => clean_js.into_bytes(),
-                        Err(js_err) => {
-                            logger.warn(anyhow!("JS validation failed for {}: {}", url, js_err));
-                            b"/* Blocked by Web Sanitizer: dangerous keywords found */".to_vec()
-                        }
-                    }
-                } else {
-                    fetched.data.clone()
-                };
-
-                let sub_path = output_dir.join(&local_name);
-                if let Err(e) = fs::write(&sub_path, &sanitized_data) {
-                    logger.error(anyhow!("Failed to write sub-resource to {:?}: {}", sub_path, e));
-                }
-            }
-        });
+    for (sub_url, local_name) in discovered {
+        enqueue_subresource_if_allowed(&session, sub_url, local_name, 1);
     }
 }
 
+/// Worker task fetching a remote HTML document, sanitizing it, and enqueuing referenced sub-resources.
+fn process_url_task(
+    session: Arc<CrawlSession>,
+    url: Url,
+    index: usize,
+) {
+    if let Some(original) = check_domain(&url)
+        && let Err(e) = session.policy.urls.idn_action.handle_error(&session.logger, IDN(original))
+    {
+        session.logger.error(e);
+        return;
+    }
+
+    if let Some(host) = url.host().map(|x| x.to_owned())
+        && session.policy.urls.dangerous_domains.iter().any(|x| host.matches(&x.0))
+        && let Err(e) = session.policy.connections.dangerous_domain_action.handle_error(&session.logger, DangerousDomain(host.to_owned()))
+    {
+        session.logger.error(e);
+        return;
+    }
+
+    let output_path = session.output_dir.join(format!("{index}.html"));
+    let fetch_result = session.rt_handle.block_on(async {
+        session.client.fetch_and_sanitize_html(&url, &session.logger, &output_path, &session.policy).await
+    });
+
+    let (final_base, discovered) = match fetch_result {
+        Ok(res) => res,
+        Err(error) => {
+            session.logger.error(anyhow!("Could not fetch url {}: {}", url, error));
+            return;
+        }
+    };
+
+    // Record the main HTML page request and visit
+    {
+        let mut visited = session.visited.lock().unwrap();
+        visited.insert(url.clone());
+        if url != final_base {
+            visited.insert(final_base.clone());
+        }
+        let mut total_requests = session.total_requests.lock().unwrap();
+        *total_requests += 1;
+    }
+
+    for (sub_url, local_name) in discovered {
+        enqueue_subresource_if_allowed(&session, sub_url, local_name, 1);
+    }
+}
+
+/// Worker task fetching and sanitizing a single sub-resource URL. Recursively enqueues nested resources (like inside CSS).
+fn crawl_subresource_task(
+    session: Arc<CrawlSession>,
+    url: Url,
+    local_name: String,
+    depth: usize,
+) {
+    let max_depth = session.policy.resources.max_depth;
+    if depth > max_depth {
+        return;
+    }
+
+    let remaining_bytes = {
+        let max_bytes = session.policy.resources.max_bytes;
+        let total_bytes = session.total_bytes.lock().unwrap();
+        max_bytes.saturating_sub(*total_bytes)
+    };
+
+    if remaining_bytes == 0 {
+        let err = ContentTooLong(session.policy.resources.max_bytes);
+        let _ = session.policy.resources.max_bytes_action.handle_error(&session.logger, err);
+        return;
+    }
+
+    session.logger.info(anyhow!("Crawling sub-resource (depth {}): {}", depth, url));
+
+    let fetch_res = session.rt_handle.block_on(async {
+        session.client.fetch_raw(&url, &session.logger, &session.policy, remaining_bytes).await
+    });
+
+    let fetched = match fetch_res {
+        Ok(f) => f,
+        Err(e) => {
+            session.logger.warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
+            let total_bytes_val = *session.total_bytes.lock().unwrap();
+            if total_bytes_val + remaining_bytes >= session.policy.resources.max_bytes {
+                let err = ContentTooLong(session.policy.resources.max_bytes);
+                let _ = session.policy.resources.max_bytes_action.handle_error(&session.logger, err);
+            }
+            return;
+        }
+    };
+
+    {
+        let mut total_bytes = session.total_bytes.lock().unwrap();
+        *total_bytes += fetched.data.len();
+    }
+
+    let decl_type = fetched.content_type.as_deref();
+    if let Err(mime_err) = validate_mime(decl_type, &fetched.data) {
+        session.logger.warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
+        return;
+    }
+
+    let sniffed = sniff_mime(&fetched.data).unwrap_or(decl_type.unwrap_or(""));
+    let is_jpeg = sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
+    let is_png = sniffed == "image/png" || url.path().ends_with(".png");
+    let is_css = sniffed == "text/css" || url.path().ends_with(".css");
+    let is_js = sniffed == "text/javascript" || sniffed == "application/javascript" || url.path().ends_with(".js");
+
+    let sanitized_data = if is_jpeg {
+        strip_jpeg_metadata(&fetched.data)
+    } else if is_png {
+        strip_png_metadata(&fetched.data)
+    } else if is_css {
+        let css_str = String::from_utf8_lossy(&fetched.data);
+        let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
+        if depth + 1 <= max_depth {
+            for (n_url, n_local) in nested_urls {
+                enqueue_subresource_if_allowed(&session, n_url, n_local, depth + 1);
+            }
+        }
+        sanitized_css.into_bytes()
+    } else if is_js {
+        let js_str = String::from_utf8_lossy(&fetched.data);
+        match sanitize_javascript(&js_str) {
+            Ok(clean_js) => clean_js.into_bytes(),
+            Err(js_err) => {
+                session.logger.warn(anyhow!("JS validation failed for {}: {}", url, js_err));
+                b"/* Blocked by Web Sanitizer: dangerous keywords found */".to_vec()
+            }
+        }
+    } else {
+        fetched.data.clone()
+    };
+
+    let sub_path = session.output_dir.join(&local_name);
+    if let Err(e) = fs::write(&sub_path, &sanitized_data) {
+        session.logger.error(anyhow!("Failed to write sub-resource to {:?}: {}", sub_path, e));
+    }
+}
+
+/// Helper that checks limits and registers a sub-resource URL, then enqueues it if valid and not visited.
+fn enqueue_subresource_if_allowed(
+    session: &Arc<CrawlSession>,
+    url: Url,
+    local_name: String,
+    depth: usize,
+) {
+    let max_requests = session.policy.resources.max_requests;
+
+    let mut visited = session.visited.lock().unwrap();
+    if visited.contains(&url) {
+        return;
+    }
+
+    let mut total_requests = session.total_requests.lock().unwrap();
+    if *total_requests >= max_requests {
+        session.logger.warn(anyhow!("Sub-resource crawl limit reached: max_requests = {}", max_requests));
+        return;
+    }
+
+    visited.insert(url.clone());
+    *total_requests += 1;
+
+    drop(total_requests);
+    drop(visited);
+
+    let url_clone = url.clone();
+    let local_name_clone = local_name.clone();
+    session.enqueue_task(move |s| {
+        crawl_subresource_task(s, url_clone, local_name_clone, depth);
+    });
+}
 
 /// Runs the main CLI application workflow: parses args, loads policy, submits jobs to the thread pool, and blocks until completion.
 ///
@@ -364,32 +441,49 @@ pub async fn run() -> Result<()> {
     let policy = Arc::new(policy);
     let max_size = (sources.len() as f64).log10().ceil() as usize;
 
-    let pool = ThreadPool::new(args.workers); 
+    let pool = Arc::new(ThreadPool::new(args.workers)); 
     let rt_handle = tokio::runtime::Handle::current();
     let output_dir = Arc::new(args.output_dir);
 
-    sources.into_iter().enumerate().for_each(|(i, source)| {
+    let mut sessions = Vec::new();
+
+    for (i, source) in sources.into_iter().enumerate() {
         let logger = Logger {
             path: Arc::new(PathBuf::new()),
             index: i,
             max_size,
         };
-        let client = Arc::clone(&client);
-        let policy = Arc::clone(&policy);
-        let rt_handle = rt_handle.clone();
-        let output_dir = Arc::clone(&output_dir);
+        
+        let session = Arc::new(CrawlSession::new(
+            Arc::clone(&client),
+            Arc::clone(&policy),
+            logger,
+            rt_handle.clone(),
+            Arc::clone(&output_dir),
+            Arc::clone(&pool),
+        ));
+        sessions.push(Arc::clone(&session));
 
-        pool.push_job(move || match source {
+        match source {
             InputSource::Url(url) => {
-                process_url(url, i, &client, &policy, &logger, &rt_handle, &output_dir);
+                session.enqueue_task(move |s| {
+                    process_url_task(s, url, i);
+                });
             }
             InputSource::File(path) => {
-                process_file(path, i, &client, &policy, &logger, &rt_handle, &output_dir);
+                session.enqueue_task(move |s| {
+                    process_file_task(s, path, i);
+                });
             }
-        });
-    });
+        }
+    }
 
-    drop(pool); // This blocks until all jobs are executed
+    // Wait for all crawl sessions to finish processing their task queues
+    for session in &sessions {
+        session.wait_until_done();
+    }
+
+    drop(pool); // This joins the pool threads
 
     Ok(())
 }

@@ -1,16 +1,10 @@
 use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource};
 use crate::sanitizer_engine::errors::{ContentTooLong, DangerousDomain, IDN, TooManyRedirects};
 use crate::sanitizer_engine::html::create_rewriter;
-use crate::sanitizer_engine::resource_sanitizer::{
-    sniff_mime, validate_mime, sanitize_javascript, sanitize_css,
-    strip_jpeg_metadata, strip_png_metadata,
-};
 use crate::sanitizer_engine::log::Logger;
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
-use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
-use std::fs;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -388,53 +382,30 @@ impl SanitizerHttpClient {
         })
     }
 
-    /// Fetches a URL and recursively fetches and sanitises all its referenced sub-resources.
-    ///
-    /// # Inputs
-    /// * `root_url` - The root HTTPS URL to start parsing and crawling.
-    /// * `logger` - The logging interface.
-    /// * `output_path` - The path to save the main sanitized HTML page.
-    /// * `policy` - The security policy configuration.
-    ///
-    /// # Returns
-    /// * `Result<()>` - `Ok(())` on success, or an error if downloading/writing fails.
-    pub async fn fetch_and_crawl(
+    /// Fetch a single HTML URL, sanitize/rewrite it, and collect discovered subresources.
+    pub async fn fetch_and_sanitize_html(
         &self,
-        root_url: &Url,
+        url: &Url,
         logger: &Logger,
         output_path: &PathBuf,
         policy: &Policy,
-    ) -> Result<()> {
-        if root_url.scheme() != "https" {
+    ) -> Result<(Url, Vec<(Url, String)>)> {
+        if url.scheme() != "https" {
             return Err(anyhow!("Only HTTPS URLs are permitted"));
         }
 
-        // 1. Initialise limits and crawler state
-        let max_requests = policy.resources.max_requests;
-        let max_bytes = policy.resources.max_bytes;
-        let max_bytes_action = policy.resources.max_bytes_action;
-        let max_depth = policy.resources.max_depth;
-
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        let mut total_requests = 1; // 1 request for the main HTML
-        let mut total_bytes = 0;
-
-        // Ensure target directory exists
-        let output_dir = output_path.parent().ok_or_else(|| anyhow!("Invalid output path"))?;
-        fs::create_dir_all(output_dir).context("Failed to create output subdirectory")?;
-
-        // 2. Fetch the main HTML
         let response = self
             .client
-            .get(root_url.clone())
+            .get(url.clone())
             .send()
             .await
-            .with_context(|| format!("Request failed for URL: {}", root_url))?;
+            .with_context(|| format!("Request failed for URL: {}", url))?;
 
         if !response.status().is_success() {
             return Err(anyhow!("Server returned error status: {}", response.status()));
         }
+
+        let max_bytes = policy.resources.max_bytes;
 
         // Content-Length check for HTML
         if let Some(length) = response
@@ -456,144 +427,49 @@ impl SanitizerHttpClient {
         let is_html = content_type
             .as_ref()
             .map(|ct| ct.contains("text/html"))
-            .unwrap_or(true); // default to true for the root resource if not specified
+            .unwrap_or(true);
 
-        visited.insert(root_url.clone());
+        if !is_html {
+            return Err(anyhow!("Root URL did not return HTML content type"));
+        }
 
         let mut stream = response.bytes_stream();
-        
-        let crawler_state = if is_html && policy.resources.fetch_sub_resources {
-            let base_url = Arc::new(Mutex::new(root_url.clone()));
-            let sub_resources = Arc::new(Mutex::new(Vec::new()));
-            Some((base_url, sub_resources))
-        } else {
-            None
-        };
+        let mut total_bytes = 0;
+
+        let base_url = Arc::new(Mutex::new(url.clone()));
+        let sub_resources = Arc::new(Mutex::new(Vec::new()));
 
         let file = File::create(output_path)?;
-        let mut rewriter = create_rewriter(logger, policy, crawler_state.clone(), file);
+        let mut rewriter = create_rewriter(
+            logger,
+            policy,
+            Some((Arc::clone(&base_url), Arc::clone(&sub_resources))),
+            file,
+        );
 
         while let Some(item) = stream.next().await {
-            let chunk = item.context("Error while streaming body")?;
+            let chunk = item.context("Error while streaming HTML body")?;
             total_bytes += chunk.len();
             
             if total_bytes > max_bytes {
-                let err = ContentTooLong(max_bytes);
-                if let Err(e) = max_bytes_action.handle_error(logger, err) {
-                    return Err(e.into());
-                }
-                break;
+                return Err(ContentTooLong(max_bytes).into());
             }
             
             rewriter.write(&chunk)?;
         }
         
-        let _ = rewriter.end();
+        rewriter.end()?;
 
-        // Populate the queue from the discovered sub-resources
-        if let Some((_, sub_resources)) = crawler_state {
-            let discovered = sub_resources.lock().unwrap();
-            for (sub_url, local_name) in discovered.iter() {
-                if !visited.contains(sub_url) {
-                    queue.push_back((sub_url.clone(), local_name.clone(), 1));
-                }
-            }
-        }
+        let final_base = {
+            let guard = base_url.lock().unwrap();
+            guard.clone()
+        };
+        let discovered = {
+            let guard = sub_resources.lock().unwrap();
+            guard.clone()
+        };
 
-        // 3. Recursive crawler loop
-        while let Some((url, local_name, depth)) = queue.pop_front() {
-            if depth > max_depth {
-                continue;
-            }
-            if visited.contains(&url) {
-                continue;
-            }
-            if total_requests >= max_requests {
-                logger.warn(anyhow!("Sub-resource crawl limit reached: max_requests = {}", max_requests));
-                break;
-            }
-
-            total_requests += 1;
-            
-            // Check remaining bytes budget
-            let remaining_bytes = max_bytes.saturating_sub(total_bytes);
-            if remaining_bytes == 0 {
-                let err = ContentTooLong(max_bytes);
-                let _ = max_bytes_action.handle_error(logger, err);
-                break;
-            }
-
-            logger.info(anyhow!("Crawling sub-resource (depth {}): {}", depth, url));
-
-            // Fetch the sub-resource raw bytes
-            let fetch_res = self.fetch_raw(&url, logger, policy, remaining_bytes).await;
-            let fetched = match fetch_res {
-                Ok(f) => f,
-                Err(e) => {
-                    logger.warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
-                    if total_bytes + remaining_bytes >= max_bytes {
-                        let err = ContentTooLong(max_bytes);
-                        if let Err(err_action) = max_bytes_action.handle_error(logger, err) {
-                            return Err(err_action.into());
-                        }
-                    }
-                    continue;
-                }
-            };
-
-            total_bytes += fetched.data.len();
-            visited.insert(url.clone());
-
-            // Validate MIME type
-            let decl_type = fetched.content_type.as_deref();
-            if let Err(mime_err) = validate_mime(decl_type, &fetched.data) {
-                logger.warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
-                continue;
-            }
-
-            // Determine sanitisation type
-            let sniffed = sniff_mime(&fetched.data).unwrap_or(decl_type.unwrap_or(""));
-            let is_jpeg = sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
-            let is_png = sniffed == "image/png" || url.path().ends_with(".png");
-            let is_css = sniffed == "text/css" || url.path().ends_with(".css");
-            let is_js = sniffed == "text/javascript" || sniffed == "application/javascript" || url.path().ends_with(".js");
-
-            let sanitized_data = if is_jpeg {
-                strip_jpeg_metadata(&fetched.data)
-            } else if is_png {
-                strip_png_metadata(&fetched.data)
-            } else if is_css {
-                let css_str = String::from_utf8_lossy(&fetched.data);
-                let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
-                if depth + 1 <= max_depth {
-                    for (n_url, n_local) in nested_urls {
-                        if !visited.contains(&n_url) {
-                            queue.push_back((n_url, n_local, depth + 1));
-                        }
-                    }
-                }
-                sanitized_css.into_bytes()
-            } else if is_js {
-                let js_str = String::from_utf8_lossy(&fetched.data);
-                match sanitize_javascript(&js_str) {
-                    Ok(clean_js) => clean_js.into_bytes(),
-                    Err(js_err) => {
-                        logger.warn(anyhow!("JS validation failed for {}: {}", url, js_err));
-                        b"/* Blocked by Web Sanitizer: dangerous keywords found */".to_vec()
-                    }
-                }
-            } else {
-                fetched.data.clone()
-            };
-
-            // Write the sanitised sub-resource to the output directory
-            let sub_path = output_dir.join(&local_name);
-            if let Err(e) = fs::write(&sub_path, &sanitized_data) {
-                logger.error(anyhow!("Failed to write sub-resource to {:?}: {}", sub_path, e));
-            }
-        }
-
-        Ok(())
+        Ok((final_base, discovered))
     }
 }
 
