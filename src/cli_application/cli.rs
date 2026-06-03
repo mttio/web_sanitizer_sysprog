@@ -6,22 +6,23 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 use crate::cli_application::http_client::SanitizerHttpClient;
 use crate::sanitizer_engine::concurrency::ThreadPool;
 use crate::sanitizer_engine::engine_structs::InputSource;
-use crate::sanitizer_engine::errors::{DangerousDomain, IDN, ContentTooLong};
+use crate::sanitizer_engine::errors::{ContentTooLong, DangerousDomain, IDN};
 use crate::sanitizer_engine::html::create_rewriter;
 use crate::sanitizer_engine::log::{LogLevel, Logger};
 use crate::sanitizer_engine::policy::Policy;
-use crate::sanitizer_engine::url::{RuleMatch, check_domain};
 use crate::sanitizer_engine::resource_sanitizer::{
-    validate_mime, sniff_mime, strip_jpeg_metadata, strip_png_metadata, sanitize_css, sanitize_javascript, clean_mime,
+    clean_mime, sanitize_css, sanitize_javascript, sniff_mime, strip_jpeg_metadata,
+    strip_png_metadata, validate_mime,
 };
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, Condvar};
+use crate::sanitizer_engine::url::{RuleMatch, check_domain};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde_json;
+use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, BufReader};
 use std::fs::File;
+use std::io::{BufReader, Read};
+use std::sync::{Arc, Condvar, Mutex};
 
 use std::path::PathBuf;
 use url::Url;
@@ -184,21 +185,17 @@ impl CrawlSession {
 }
 
 /// Worker task processing a local HTML file. Parses HTML, rewrites links, and enqueues referenced sub-resources.
-fn process_file_task(
-    session: Arc<CrawlSession>,
-    path: PathBuf,
-    index: usize,
-) {
+fn process_file_task(session: Arc<CrawlSession>, path: PathBuf, index: usize) {
     let output_path = session.output_dir.join(format!("{index}.html"));
     let sub_resources = Arc::new(Mutex::new(Vec::new()));
 
     let file_result = || -> Result<()> {
-        let input_file = File::open(&path)
-            .with_context(|| format!("Failed to open local file {:?}", path))?;
+        let input_file =
+            File::open(&path).with_context(|| format!("Failed to open local file {:?}", path))?;
         let mut reader = BufReader::new(input_file);
         let output_file = File::create(&output_path)
             .with_context(|| format!("Failed to create output file {:?}", output_path))?;
-        
+
         let crawler_state = if session.policy.resources.fetch_sub_resources {
             let dummy_base = Arc::new(Mutex::new(Url::parse("https://localhost/").unwrap()));
             Some((dummy_base, Arc::clone(&sub_resources)))
@@ -206,18 +203,22 @@ fn process_file_task(
             None
         };
 
-        let mut rewriter = create_rewriter(&session.logger, &session.policy, crawler_state, output_file);
+        let mut rewriter =
+            create_rewriter(&session.logger, &session.policy, crawler_state, output_file);
         let mut buffer = [0; 8192];
         loop {
-            let n = reader.read(&mut buffer)
+            let n = reader
+                .read(&mut buffer)
                 .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
             if n == 0 {
                 break;
             }
-            rewriter.write(&buffer[..n])
+            rewriter
+                .write(&buffer[..n])
                 .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
         }
-        rewriter.end()
+        rewriter
+            .end()
             .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
         Ok(())
     }();
@@ -238,21 +239,30 @@ fn process_file_task(
 }
 
 /// Worker task fetching a remote HTML document, sanitizing it, and enqueuing referenced sub-resources.
-fn process_url_task(
-    session: Arc<CrawlSession>,
-    url: Url,
-    index: usize,
-) {
+fn process_url_task(session: Arc<CrawlSession>, url: Url, index: usize) {
     if let Some(original) = check_domain(&url)
-        && let Err(e) = session.policy.urls.idn_action.handle_error(&session.logger, IDN(original))
+        && let Err(e) = session
+            .policy
+            .urls
+            .idn_action
+            .handle_error(&session.logger, IDN(original))
     {
         session.logger.error(e);
         return;
     }
 
     if let Some(host) = url.host().map(|x| x.to_owned())
-        && session.policy.urls.dangerous_domains.iter().any(|x| host.matches(&x.0))
-        && let Err(e) = session.policy.connections.dangerous_domain_action.handle_error(&session.logger, DangerousDomain(host.to_owned()))
+        && session
+            .policy
+            .urls
+            .dangerous_domains
+            .iter()
+            .any(|x| host.matches(&x.0))
+        && let Err(e) = session
+            .policy
+            .connections
+            .dangerous_domain_action
+            .handle_error(&session.logger, DangerousDomain(host.to_owned()))
     {
         session.logger.error(e);
         return;
@@ -260,13 +270,18 @@ fn process_url_task(
 
     let output_path = session.output_dir.join(format!("{index}.html"));
     let fetch_result = session.rt_handle.block_on(async {
-        session.client.fetch_and_sanitize_html(&url, &session.logger, &output_path, &session.policy).await
+        session
+            .client
+            .fetch_and_sanitize_html(&url, &session.logger, &output_path, &session.policy)
+            .await
     });
 
     let (final_base, discovered) = match fetch_result {
         Ok(res) => res,
         Err(error) => {
-            session.logger.error(anyhow!("Could not fetch url {}: {}", url, error));
+            session
+                .logger
+                .error(anyhow!("Could not fetch url {}: {}", url, error));
             return;
         }
     };
@@ -288,12 +303,7 @@ fn process_url_task(
 }
 
 /// Worker task fetching and sanitizing a single sub-resource URL. Recursively enqueues nested resources (like inside CSS).
-fn crawl_subresource_task(
-    session: Arc<CrawlSession>,
-    url: Url,
-    local_name: String,
-    depth: usize,
-) {
+fn crawl_subresource_task(session: Arc<CrawlSession>, url: Url, local_name: String, depth: usize) {
     let max_depth = session.policy.resources.max_depth;
     if depth > max_depth {
         return;
@@ -307,24 +317,39 @@ fn crawl_subresource_task(
 
     if remaining_bytes == 0 {
         let err = ContentTooLong(session.policy.resources.max_bytes);
-        let _ = session.policy.resources.max_bytes_action.handle_error(&session.logger, err);
+        let _ = session
+            .policy
+            .resources
+            .max_bytes_action
+            .handle_error(&session.logger, err);
         return;
     }
 
-    session.logger.info(anyhow!("Crawling sub-resource (depth {}): {}", depth, url));
+    session
+        .logger
+        .info(anyhow!("Crawling sub-resource (depth {}): {}", depth, url));
 
     let fetch_res = session.rt_handle.block_on(async {
-        session.client.fetch_raw(&url, &session.logger, &session.policy, remaining_bytes).await
+        session
+            .client
+            .fetch_raw(&url, &session.logger, &session.policy, remaining_bytes)
+            .await
     });
 
     let fetched = match fetch_res {
         Ok(f) => f,
         Err(e) => {
-            session.logger.warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
+            session
+                .logger
+                .warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
             let total_bytes_val = *session.total_bytes.lock().unwrap();
             if total_bytes_val + remaining_bytes >= session.policy.resources.max_bytes {
                 let err = ContentTooLong(session.policy.resources.max_bytes);
-                let _ = session.policy.resources.max_bytes_action.handle_error(&session.logger, err);
+                let _ = session
+                    .policy
+                    .resources
+                    .max_bytes_action
+                    .handle_error(&session.logger, err);
             }
             return;
         }
@@ -346,10 +371,13 @@ fn crawl_subresource_task(
     }
 
     let sniffed = sniffed.or(declared.as_deref()).unwrap_or_default();
-    let is_jpeg = sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
+    let is_jpeg =
+        sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
     let is_png = sniffed == "image/png" || url.path().ends_with(".png");
     let is_css = sniffed == "text/css" || url.path().ends_with(".css");
-    let is_js = sniffed == "text/javascript" || sniffed == "application/javascript" || url.path().ends_with(".js");
+    let is_js = sniffed == "text/javascript"
+        || sniffed == "application/javascript"
+        || url.path().ends_with(".js");
 
     let sanitized_data = if is_jpeg {
         strip_jpeg_metadata(&fetched.data)
@@ -358,7 +386,7 @@ fn crawl_subresource_task(
     } else if is_css {
         let css_str = String::from_utf8_lossy(&fetched.data);
         let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
-        if depth + 1 <= max_depth {
+        if depth < max_depth {
             for (n_url, n_local) in nested_urls {
                 enqueue_subresource_if_allowed(&session, n_url, n_local, depth + 1);
             }
@@ -369,7 +397,9 @@ fn crawl_subresource_task(
         match sanitize_javascript(&js_str) {
             Ok(clean_js) => clean_js.into_bytes(),
             Err(js_err) => {
-                session.logger.warn(anyhow!("JS validation failed for {}: {}", url, js_err));
+                session
+                    .logger
+                    .warn(anyhow!("JS validation failed for {}: {}", url, js_err));
                 b"/* Blocked by Web Sanitizer: dangerous keywords found */".to_vec()
             }
         }
@@ -379,7 +409,11 @@ fn crawl_subresource_task(
 
     let sub_path = session.output_dir.join(&local_name);
     if let Err(e) = fs::write(&sub_path, &sanitized_data) {
-        session.logger.error(anyhow!("Failed to write sub-resource to {:?}: {}", sub_path, e));
+        session.logger.error(anyhow!(
+            "Failed to write sub-resource to {:?}: {}",
+            sub_path,
+            e
+        ));
     }
 }
 
@@ -399,7 +433,10 @@ fn enqueue_subresource_if_allowed(
 
     let mut total_requests = session.total_requests.lock().unwrap();
     if *total_requests >= max_requests {
-        session.logger.warn(anyhow!("Sub-resource crawl limit reached: max_requests = {}", max_requests));
+        session.logger.warn(anyhow!(
+            "Sub-resource crawl limit reached: max_requests = {}",
+            max_requests
+        ));
         return;
     }
 
@@ -409,10 +446,8 @@ fn enqueue_subresource_if_allowed(
     drop(total_requests);
     drop(visited);
 
-    let url_clone = url.clone();
-    let local_name_clone = local_name.clone();
     session.enqueue_task(move |s| {
-        crawl_subresource_task(s, url_clone, local_name_clone, depth);
+        crawl_subresource_task(s, url, local_name, depth);
     });
 }
 
@@ -439,13 +474,16 @@ pub async fn run() -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("Failed to create output directory: {:?}", args.output_dir))?;
 
-    println!("Successfully created output directory: {:?}", args.output_dir);
+    println!(
+        "Successfully created output directory: {:?}",
+        args.output_dir
+    );
 
     let client = Arc::new(SanitizerHttpClient::new(&policy).await?);
     let policy = Arc::new(policy);
     let max_size = (sources.len() as f64).log10().ceil() as usize;
 
-    let pool = Arc::new(ThreadPool::new(args.workers)); 
+    let pool = Arc::new(ThreadPool::new(args.workers));
     let rt_handle = tokio::runtime::Handle::current();
     let output_dir = Arc::new(args.output_dir);
 
@@ -457,7 +495,7 @@ pub async fn run() -> Result<()> {
             index: i,
             max_size,
         };
-        
+
         let session = Arc::new(CrawlSession::new(
             Arc::clone(&client),
             Arc::clone(&policy),
@@ -492,15 +530,6 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-
-
-
-
-
-
-
-
-
 /// Helper to determine if a directory entry starts with a dot (hidden file/folder).
 ///
 /// # Inputs
@@ -516,11 +545,6 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
         .map(|s| s.starts_with('.'))
         .unwrap_or(false)
 }
-
-
-
-
-
 
 /*======================== TESTS ============================*/
 

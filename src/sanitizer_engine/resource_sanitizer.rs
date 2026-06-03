@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use std::error::Error;
 use std::fmt::Display;
 use url::Url;
@@ -97,23 +98,24 @@ pub fn validate_mime(declared: Option<&str>, sniffed: Option<&str>) -> Result<()
 pub fn generate_local_filename(url: &Url, default_ext: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
     let mut hasher = DefaultHasher::new();
-    url.as_str().hash(&mut hasher);
+    url.hash(&mut hasher);
     let hash_val = hasher.finish();
-    
+
     // Try to extract clean extension from path
-    let last_segment = url.path().split('/').last().unwrap_or("");
-    let ext = if last_segment.contains('.') {
-        last_segment.split('.').last().unwrap_or(default_ext)
-    } else {
-        default_ext
-    };
-    let ext = ext.chars()
+    let last_segment = url.path().split('/').next_back().unwrap_or("");
+    let ext = last_segment
+        .rsplit_once('.')
+        .map(|(_, x)| x)
+        .unwrap_or(default_ext);
+    let ext = ext
+        .chars()
         .filter(|c| c.is_alphanumeric())
         .collect::<String>();
-    
-    let ext = if ext.is_empty() { default_ext.to_string() } else { ext };
-    
+
+    let ext = if ext.is_empty() { default_ext } else { &ext };
+
     format!("sub_{:016x}.{}", hash_val, ext)
 }
 
@@ -150,7 +152,7 @@ pub fn strip_jpeg_metadata(data: &[u8]) -> Vec<u8> {
                 output.push(0xD9);
                 break;
             }
-            if marker >= 0xD0 && marker <= 0xD7 {
+            if (0xD0..=0xD7).contains(&marker) {
                 output.push(0xFF);
                 output.push(marker);
                 i += 2;
@@ -201,17 +203,17 @@ pub fn strip_png_metadata(data: &[u8]) -> Vec<u8> {
             | (data[i + 2] as u32) << 8
             | (data[i + 3] as u32)) as usize;
         let chunk_type = &data[i + 4..i + 8];
-        
+
         if i + 12 + chunk_len > data.len() {
             output.extend_from_slice(&data[i..]);
             break;
         }
-        
-        let is_metadata = match chunk_type {
-            b"tEXt" | b"zTXt" | b"iTXt" | b"eXIf" | b"iCCP" | b"gAMA" | b"sRGB" | b"tIME" => true,
-            _ => false,
-        };
-        
+
+        let is_metadata = matches!(
+            chunk_type,
+            b"tEXt" | b"zTXt" | b"iTXt" | b"eXIf" | b"iCCP" | b"gAMA" | b"sRGB" | b"tIME"
+        );
+
         if is_metadata {
             i += 12 + chunk_len;
         } else {
@@ -243,26 +245,23 @@ pub fn sanitize_javascript(content: &str) -> Result<String, SanitizationError> {
                     }
                 }
                 if temp.peek() == Some(&'(') {
-                    return Err(SanitizationError("Dangerous construct 'eval(...)' detected in JS".into()));
+                    return Err(SanitizationError(
+                        "Dangerous construct 'eval(...)' detected in JS".into(),
+                    ));
                 }
             }
         }
         if c == 'd' {
             let mut temp = chars.clone();
-            if temp.next() == Some('o') && temp.next() == Some('c') && temp.next() == Some('u')
-                && temp.next() == Some('m') && temp.next() == Some('e') && temp.next() == Some('n')
-                && temp.next() == Some('t') && temp.next() == Some('.')
-            {
-                let mut is_write = false;
-                let mut next_chars = temp.clone();
-                if next_chars.next() == Some('w') && next_chars.next() == Some('r')
-                    && next_chars.next() == Some('i') && next_chars.next() == Some('t')
-                    && next_chars.next() == Some('e')
-                {
-                    is_write = true;
-                }
-                if is_write {
-                    return Err(SanitizationError("Dangerous construct 'document.write(...)' detected in JS".into()));
+            if temp.next_array() == Some(['o', 'c', 'u', 'm', 'e', 'n', 't']) {
+                let mut temp = temp.skip_while(|c| c.is_whitespace());
+                if temp.next() == Some('.') {
+                    let mut temp = temp.skip_while(|c| c.is_whitespace());
+                    if temp.next_array() == Some(['w', 'r', 'i', 't', 'e']) {
+                        return Err(SanitizationError(
+                            "Dangerous construct 'document.write(...)' detected in JS".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -285,20 +284,19 @@ pub fn sanitize_css(css: &str, base_url: &Url) -> (String, Vec<(Url, String)>) {
     let mut extracted = Vec::new();
     let chars: Vec<char> = css.chars().collect();
     let mut i = 0;
-    
+
     while i < chars.len() {
         // Match @import
-        if i + 7 < chars.len() && chars[i] == '@' 
-            && chars[i+1] == 'i' && chars[i+2] == 'm' && chars[i+3] == 'p'
-            && chars[i+4] == 'o' && chars[i+5] == 'r' && chars[i+6] == 't'
-            && (chars[i+7].is_whitespace() || chars[i+7] == '(')
+        if i + 7 < chars.len()
+            && chars[i..i + 7] == ['@', 'i', 'm', 'p', 'o', 'r', 't']
+            && (chars[i + 7].is_whitespace() || chars[i + 7] == '(')
         {
             i += 7;
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
             let mut url_str = String::new();
-            if i + 4 <= chars.len() && chars[i] == 'u' && chars[i+1] == 'r' && chars[i+2] == 'l' && chars[i+3] == '(' {
+            if i + 4 <= chars.len() && chars[i..i + 4] == ['u', 'r', 'l', '('] {
                 i += 4;
                 while i < chars.len() && chars[i] != ')' {
                     url_str.push(chars[i]);
@@ -323,27 +321,32 @@ pub fn sanitize_css(css: &str, base_url: &Url) -> (String, Vec<(Url, String)>) {
                     i += 1;
                 }
             }
-            
+
             while i < chars.len() && chars[i] != ';' {
                 i += 1;
             }
             if i < chars.len() && chars[i] == ';' {
                 i += 1;
             }
-            
-            let url_clean = url_str.trim().trim_matches('"').trim_matches('\'').trim().to_string();
-            if !url_clean.is_empty() {
-                if let Ok(resolved_url) = base_url.join(&url_clean) {
-                    let local_name = generate_local_filename(&resolved_url, "css");
-                    extracted.push((resolved_url, local_name.clone()));
-                    output.push_str(&format!("@import \"{}\";", local_name));
-                }
+
+            let url_clean = url_str
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string();
+            if !url_clean.is_empty()
+                && let Ok(resolved_url) = base_url.join(&url_clean)
+            {
+                let local_name = generate_local_filename(&resolved_url, "css");
+                extracted.push((resolved_url, local_name.clone()));
+                output.push_str(&format!("@import \"{}\";", local_name));
             }
             continue;
         }
-        
+
         // Match url(
-        if i + 4 <= chars.len() && chars[i] == 'u' && chars[i+1] == 'r' && chars[i+2] == 'l' && chars[i+3] == '(' {
+        if i + 4 <= chars.len() && chars[i..i + 4] == ['u', 'r', 'l', '('] {
             i += 4;
             let mut url_str = String::new();
             while i < chars.len() && chars[i] != ')' {
@@ -353,12 +356,23 @@ pub fn sanitize_css(css: &str, base_url: &Url) -> (String, Vec<(Url, String)>) {
             if i < chars.len() {
                 i += 1;
             }
-            
-            let url_clean = url_str.trim().trim_matches('"').trim_matches('\'').trim().to_string();
+
+            let url_clean = url_str
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string();
             if url_clean.starts_with("data:") || url_clean.starts_with("javascript:") {
                 output.push_str("url(\"\")");
             } else if let Ok(resolved_url) = base_url.join(&url_clean) {
-                let ext = url_clean.split('.').last().unwrap_or("bin").split('?').next().unwrap_or("bin");
+                let ext = url_clean
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("bin")
+                    .split('?')
+                    .next()
+                    .unwrap_or("bin");
                 let local_name = generate_local_filename(&resolved_url, ext);
                 extracted.push((resolved_url, local_name.clone()));
                 output.push_str(&format!("url(\"{}\")", local_name));
@@ -367,30 +381,15 @@ pub fn sanitize_css(css: &str, base_url: &Url) -> (String, Vec<(Url, String)>) {
             }
             continue;
         }
-        
+
         output.push(chars[i]);
         i += 1;
     }
-    
+
     (output, extracted)
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 //========================= TESTS ==============================
-
-
 
 #[cfg(test)]
 mod tests {
@@ -398,7 +397,10 @@ mod tests {
 
     #[test]
     fn test_sniff_mime() {
-        assert_eq!(sniff_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), Some("image/png"));
+        assert_eq!(
+            sniff_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some("image/png")
+        );
         assert_eq!(sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(sniff_mime(b"GIF89a..."), Some("image/gif"));
         assert_eq!(sniff_mime(b"%PDF-1.4"), Some("application/pdf"));
@@ -420,7 +422,9 @@ mod tests {
 
     #[test]
     fn test_strip_jpeg_metadata() {
-        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9];
+        let jpeg = vec![
+            0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9,
+        ];
         let stripped = strip_jpeg_metadata(&jpeg);
         assert_eq!(stripped, vec![0xFF, 0xD8, 0xFF, 0xD9]);
     }
@@ -433,9 +437,12 @@ mod tests {
         png.extend_from_slice(b"tEXt"); // type
         png.extend_from_slice(b"data"); // data
         png.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // CRC
-        
+
         let stripped = strip_png_metadata(&png);
-        assert_eq!(stripped, vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            stripped,
+            vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
     }
 
     #[test]
@@ -450,12 +457,18 @@ mod tests {
         let base_url = Url::parse("https://example.com/dir/style.css").unwrap();
         let css = "body { background: url('img.png'); } @import 'common.css';";
         let (rewritten, extracted) = sanitize_css(css, &base_url);
-        
+
         assert!(rewritten.contains("url(\"sub_"));
         assert!(rewritten.contains("@import \"sub_"));
         assert_eq!(extracted.len(), 2);
-        assert_eq!(extracted[0].0, Url::parse("https://example.com/dir/img.png").unwrap());
-        assert_eq!(extracted[1].0, Url::parse("https://example.com/dir/common.css").unwrap());
+        assert_eq!(
+            extracted[0].0,
+            Url::parse("https://example.com/dir/img.png").unwrap()
+        );
+        assert_eq!(
+            extracted[1].0,
+            Url::parse("https://example.com/dir/common.css").unwrap()
+        );
     }
 
     #[test]
@@ -486,4 +499,3 @@ mod tests {
         assert_eq!(extracted.len(), 0);
     }
 }
-
