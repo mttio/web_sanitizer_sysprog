@@ -12,7 +12,7 @@ use crate::sanitizer_engine::log::{LogLevel, Logger};
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
 use crate::sanitizer_engine::resource_sanitizer::{
-    validate_mime, sniff_mime, strip_jpeg_metadata, strip_png_metadata, sanitize_css, sanitize_javascript,
+    validate_mime, sniff_mime, strip_jpeg_metadata, strip_png_metadata, sanitize_css, sanitize_javascript, clean_mime,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Condvar};
@@ -336,12 +336,16 @@ fn crawl_subresource_task(
     }
 
     let decl_type = fetched.content_type.as_deref();
-    if let Err(mime_err) = validate_mime(decl_type, &fetched.data) {
-        session.logger.warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
+    let declared = decl_type.map(clean_mime);
+    let sniffed = sniff_mime(&fetched.data);
+    if let Err(mime_err) = validate_mime(decl_type, sniffed) {
+        session
+            .logger
+            .warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
         return;
     }
 
-    let sniffed = sniff_mime(&fetched.data).unwrap_or(decl_type.unwrap_or(""));
+    let sniffed = sniffed.or(declared.as_deref()).unwrap_or_default();
     let is_jpeg = sniffed == "image/jpeg" || url.path().ends_with(".jpg") || url.path().ends_with(".jpeg");
     let is_png = sniffed == "image/png" || url.path().ends_with(".png");
     let is_css = sniffed == "text/css" || url.path().ends_with(".css");
