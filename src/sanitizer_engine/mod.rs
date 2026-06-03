@@ -5,3 +5,4 @@ pub mod html;
 pub mod log;
 pub mod policy;
 pub mod url;
+pub mod resource_sanitizer;
