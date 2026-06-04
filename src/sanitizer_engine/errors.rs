@@ -4,6 +4,15 @@ use colored::Colorize;
 use url::Host;
 
 #[derive(Debug)]
+pub struct TimeoutError(pub String);
+impl Error for TimeoutError {}
+impl Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DNS resolution timed out for host: {}", self.0)
+    }
+}
+
+#[derive(Debug)]
 pub struct TooManyRedirects;
 impl Error for TooManyRedirects {}
 impl Display for TooManyRedirects {

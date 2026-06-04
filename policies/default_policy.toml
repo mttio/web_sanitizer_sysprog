@@ -1,5 +1,5 @@
 [logging]
-console = "info"
+console = "error"
 files = "trace"
 
 [html]
@@ -25,8 +25,8 @@ idn = "warn"
 [resources]
 fetch_sub_resources = true
 max_depth = 10
-max_requests = 10
-max_bytes = { value = 20480, level = "warn" }
+max_requests = { value = 10, level = "warn" }
+max_bytes = { value = 2048, level = "warn" }
 
 [connections]
 connection_timeout = "3s"

@@ -4,17 +4,14 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 */
 
 use crate::cli_application::http_client::SanitizerHttpClient;
-use crate::sanitizer_engine::concurrency::ThreadPool;
+use crate::sanitizer_engine::crawl_session::CrawlSession;
 use crate::sanitizer_engine::engine_structs::InputSource;
-use crate::sanitizer_engine::errors::{DangerousDomain, IDN};
-use crate::sanitizer_engine::html::create_rewriter;
-use crate::sanitizer_engine::log::{LogLevel, Logger, LoggerTrait, logging_thread};
+use crate::sanitizer_engine::log::{Logger, logging_thread};
 use crate::sanitizer_engine::policy::Policy;
-use crate::sanitizer_engine::url::{RuleMatch, check_domain};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::Parser;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs::{self};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -44,7 +41,13 @@ pub struct Args {
     pub verbose: bool,
 }
 
-/// Helper to load the sanitization policy
+/// Helper to load the sanitization policy from a JSON file.
+///
+/// # Inputs
+/// * `path` - Optional path reference to the JSON policy file.
+///
+/// # Returns
+/// * `Result<Policy>` - The parsed `Policy` struct, or the default Policy if no path is given. Returns an error if reading or parsing fails.
 fn load_policy(path: Option<&PathBuf>) -> Result<Policy> {
     let policy = match path {
         Some(path) => {
@@ -57,7 +60,13 @@ fn load_policy(path: Option<&PathBuf>) -> Result<Policy> {
     Ok(policy)
 }
 
-/// Helper to parse input patterns into concrete InputSources
+/// Helper to parse input patterns (URLs, directory paths, or files) into concrete InputSources.
+///
+/// # Inputs
+/// * `inputs` - A vector of input strings.
+///
+/// # Returns
+/// * `Result<Vec<InputSource>>` - A list of successfully parsed input sources (files and URLs).
 fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
     let mut sources = Vec::new();
     for input in inputs {
@@ -93,101 +102,14 @@ fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
     Ok(sources)
 }
 
-/// Helper to fetch and sanitize a URL source
-fn process_url(
-    url: Url,
-    index: usize,
-    client: &SanitizerHttpClient,
-    policy: &Policy,
-    logger: &Logger,
-    rt_handle: &tokio::runtime::Handle,
-    output_dir: &PathBuf,
-) {
-    if let Some(original) = check_domain(&url)
-        && let Err(e) = policy.urls.idn.handle(logger, IDN(original))
-    {
-        logger.error(e);
-        return;
-    }
-
-    if let Some(host) = url.host().map(|x| x.to_owned())
-        && policy
-            .urls
-            .dangerous_domains
-            .iter()
-            .any(|x| host.matches(&x.0))
-        && let Err(e) = policy
-            .connections
-            .dangerous_domain
-            .handle(logger, DangerousDomain(host.to_owned()))
-    {
-        logger.error(e);
-        return;
-    }
-
-    let output_path = output_dir.join(format!("{index}.html"));
-    let output = match File::create(&output_path) {
-        Ok(file) => file,
-        Err(e) => {
-            logger.error(anyhow!(
-                "Failed to create output file {:?}: {}",
-                output_path,
-                e
-            ));
-            return;
-        }
-    };
-
-    let fetch_result =
-        rt_handle.block_on(async { client.fetch_one_url(&url, logger, output, policy).await });
-
-    if let Err(error) = fetch_result {
-        logger.error(anyhow!("Could not fetch url {}: {}", url, error));
-    }
-}
-
-/// Helper to process and sanitize a local file
-fn process_file(
-    path: PathBuf,
-    index: usize,
-    policy: &Policy,
-    logger: &Logger,
-    output_dir: &PathBuf,
-) {
-    let output_path = output_dir.join(format!("{index}.html"));
-    let file_result = || -> Result<()> {
-        let input_file =
-            File::open(&path).with_context(|| format!("Failed to open local file {:?}", path))?;
-        let mut reader = BufReader::new(input_file);
-        let output_file = File::create(&output_path)
-            .with_context(|| format!("Failed to create output file {:?}", output_path))?;
-
-        let mut rewriter = create_rewriter(logger, policy, output_file);
-        let mut buffer = [0; 8192];
-        loop {
-            let n = reader
-                .read(&mut buffer)
-                .with_context(|| format!("Failed to read chunk from file {:?}", path))?;
-            if n == 0 {
-                break;
-            }
-            rewriter
-                .write(&buffer[..n])
-                .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
-        }
-        rewriter
-            .end()
-            .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
-        Ok(())
-    }();
-
-    if let Err(error) = file_result {
-        logger.log(LogLevel::Error, error);
-    }
-}
-
-/// Run the CLI application
-pub async fn run() -> Result<()> {
+/// Runs the main CLI application workflow: parses args, loads policy, submits jobs to the thread pool, and blocks until completion.
+///
+/// # Inputs
+/// * None (inputs are gathered from command line arguments via `Args::parse()`).
+///
+/// # Returns
+/// * `Result<()>` - `Ok(())` on successful completion, or an error if initialization fails.
+pub fn run() -> Result<()> {
     let args = Args::parse();
     println!("Successfully parsed args: {:?}", args);
 
@@ -220,51 +142,66 @@ pub async fn run() -> Result<()> {
             .collect(),
     ));
 
-    let client = Arc::new(SanitizerHttpClient::new(&policy, tx.clone(), url_map).await?);
     let policy = Arc::new(policy);
-    let max_size = (sources.len() as f64).log10().ceil() as usize;
 
-    let pool = ThreadPool::new(args.workers);
-    let rt_handle = tokio::runtime::Handle::current();
+    let client = Arc::new(SanitizerHttpClient::new(
+        policy.clone(),
+        tx.clone(),
+        url_map.clone(),
+    )?);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.workers)
+        .enable_time()
+        .enable_io()
+        .build()?;
     let output_dir = Arc::new(args.output_dir);
+    let max_size = sources.len();
 
-    {
-        let policy = policy.clone();
-        pool.push_job(move || logging_thread(&policy, max_size, rx));
-    }
-
-    sources.into_iter().enumerate().for_each(|(i, source)| {
+    for (i, source) in sources.into_iter().enumerate() {
         let logger = Logger {
             index: i,
             channel: tx.clone(),
         };
-        let client = Arc::clone(&client);
-        let policy = Arc::clone(&policy);
-        let rt_handle = rt_handle.clone();
-        let output_dir = Arc::clone(&output_dir);
 
-        pool.push_job(move || match source {
+        let session = Arc::new(CrawlSession::new(
+            Arc::clone(&client),
+            Arc::clone(&policy),
+            logger,
+            runtime.handle().clone(),
+            Arc::clone(&output_dir),
+            Arc::clone(&url_map),
+        ));
+
+        match source {
             InputSource::Url(url) => {
-                process_url(url, i, &client, &policy, &logger, &rt_handle, &output_dir);
+                runtime.spawn(async { session.process_url(url).await });
             }
             InputSource::File(path) => {
-                process_file(path, i, &policy, &logger, &output_dir);
+                runtime.spawn_blocking(move || session.process_file(path));
             }
-        });
-    });
+        }
+    }
 
     // Drop excess resources
     drop(tx);
     drop(client);
 
-    // This blocks until all jobs are executed
-    drop(pool);
+    logging_thread(&output_dir, &policy, max_size, rx);
 
     Ok(())
 }
 
 /*======================== HELPERS ============================*/
 
+/// Helper to determine if a directory entry starts with a dot (hidden file/folder).
+///
+/// # Inputs
+/// * `entry` - A reference to the walkdir entry.
+///
+/// # Returns
+/// * `bool` - `true` if the entry name starts with a dot, otherwise `false`.
+#[allow(dead_code)]
 fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()

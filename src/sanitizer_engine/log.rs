@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::{error::Error, fs::File};
 
@@ -55,6 +56,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
+    /// Returns `Err` if `self == Error`, otherwise returns `Ok` and logs the error message
     pub fn handle<E: Into<LoggerError>>(
         self,
         logger: &impl LoggerTrait,
@@ -99,20 +101,25 @@ pub struct LoggerMessage {
     error: Box<dyn Error + Send>,
 }
 
-pub fn logging_thread(policy: &Policy, max_size: usize, recv: Receiver<LoggerMessage>) {
+pub fn logging_thread(
+    output: &Path,
+    policy: &Policy,
+    max_size: usize,
+    channel: Receiver<LoggerMessage>,
+) {
     let mut files = (0..max_size)
-        .map(|i| File::create(format!("{i}.log")).ok())
+        .map(|i| File::create(output.join(format!("{i}.log"))).ok())
         .collect_vec();
 
-    for msg in recv {
+    let width = (max_size as f64).log10().ceil() as usize;
+
+    for msg in channel {
         let error = msg.error.to_string();
 
         if msg.level >= policy.logging.console {
             println!(
                 "[{}] {}: {}",
-                format!("{:width$}", msg.source, width = max_size)
-                    .bold()
-                    .bright_blue(),
+                format!("{:width$}", msg.source).bold().bright_blue(),
                 match msg.level {
                     LogLevel::Trace => "TRACE".bright_black(),
                     LogLevel::Debug => "DEBUG".bright_blue(),
@@ -142,7 +149,6 @@ pub fn logging_thread(policy: &Policy, max_size: usize, recv: Receiver<LoggerMes
                     LogLevel::Error => "ERROR",
                 },
                 strip_ansi_escapes::strip_str(&error),
-                width = max_size,
             );
         }
     }
