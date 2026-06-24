@@ -6,7 +6,7 @@ use std::{error::Error, fs::File};
 use chrono::Local;
 use colored::Colorize;
 use itertools::Itertools;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::LoggerError;
 use crate::policy::Policy;
@@ -45,7 +45,7 @@ pub struct Logger {
     pub channel: Sender<LoggerMessage>,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Trace,

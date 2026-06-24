@@ -47,6 +47,10 @@ pub struct Args {
     /// Verbose output
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Print the default policy
+    #[arg(short, long)]
+    pub generate_policy: bool,
 }
 
 /// Helper to load the sanitization policy from a JSON file.
@@ -120,6 +124,13 @@ fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
 pub fn run() -> Result<()> {
     let args = Args::parse();
     println!("Successfully parsed args: {:?}", args);
+
+    if args.generate_policy {
+        let string = toml::to_string_pretty(&Policy::default())
+            .context("Failed to serialize default policy")?;
+        println!("huh {string}");
+        return Ok(());
+    };
 
     let policy = load_policy(args.policy.as_ref())?;
     let sources = parse_inputs(args.inputs)?;
