@@ -4,6 +4,15 @@ use colored::Colorize;
 use url::Host;
 
 #[derive(Debug)]
+pub struct TimeoutError(pub String);
+impl Error for TimeoutError {}
+impl Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DNS resolution timed out for host: {}", self.0)
+    }
+}
+
+#[derive(Debug)]
 pub struct TooManyRedirects;
 impl Error for TooManyRedirects {}
 impl Display for TooManyRedirects {
@@ -28,9 +37,26 @@ impl Display for DangerousDomainInHtml {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "dangerous domain ({}) @{}",
+            "dangerous domain ({}) @ {}",
             self.0.to_string().bright_cyan(),
             self.1.to_string().bright_magenta(),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct EventHandler(pub String, pub Option<usize>);
+impl Error for EventHandler {}
+impl Display for EventHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "event handler ({}){}",
+            self.0.bright_cyan(),
+            match self.1 {
+                Some(x) => format!(" @ {}", x.to_string().bright_magenta()),
+                None => "".to_owned(),
+            }
         )
     }
 }
@@ -56,3 +82,5 @@ impl Display for ContentTooLong {
         )
     }
 }
+
+pub type LoggerError = Box<dyn Error + Send + Sync>;

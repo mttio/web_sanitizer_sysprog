@@ -1,21 +1,25 @@
 use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource};
-use crate::sanitizer_engine::errors::{ContentTooLong, DangerousDomain, IDN, TooManyRedirects};
-use crate::sanitizer_engine::html::create_rewriter;
-use crate::sanitizer_engine::log::Logger;
+use crate::sanitizer_engine::errors::{
+    ContentTooLong, DangerousDomain, IDN, LoggerError, TimeoutError, TooManyRedirects,
+};
+use crate::sanitizer_engine::html::{CrawlerState, create_rewriter};
+use crate::sanitizer_engine::log::{Logger, LoggerMessage};
 use crate::sanitizer_engine::policy::Policy;
 use crate::sanitizer_engine::url::{RuleMatch, check_domain};
-use std::sync::Mutex;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use hickory_resolver::TokioResolver;
-use itertools::Itertools;
+use lol_html::errors::RewritingError;
+use parking_lot::Mutex;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, header, redirect};
+use std::collections::HashMap;
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use url::Url;
 
@@ -117,14 +121,10 @@ impl Resolve for SsrfSafeDnsResolver {
 
         Box::pin(async move {
             // setting independent timeout on DNS resolution
-            let lookup = tokio::time::timeout(timeout, inner.lookup_ip(host.as_str()))
+            let lookup = tokio::time::timeout(timeout, inner.lookup_ip(&host))
                 .await
-                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("DNS resolution timed out for host: {}", host).into()
-                })?
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("DNS lookup failed for host {}: {}", host, e).into()
-                })?;
+                .map_err(|_| TimeoutError(host.clone()))?
+                .map_err(|e| format!("DNS lookup failed for host {}: {}", host, e))?;
 
             // Filter to safe IPs only;
             // reqwest automatically replaces port 0 with the Url's actual port when connecting
@@ -158,7 +158,11 @@ impl SanitizerHttpClient {
     ///
     /// # Returns
     /// * `Result<Self>` - The configured sanitizer client, or an error if DNS resolver construction fails.
-    pub async fn new(policy: &Policy) -> Result<Self> {
+    pub fn new(
+        policy: Arc<Policy>,
+        channel: Sender<LoggerMessage>,
+        url_map: Arc<Mutex<HashMap<Url, usize>>>,
+    ) -> Result<Self> {
         let resolver = TokioResolver::builder_tokio()
             .context("Failed to create DNS resolver builder")?
             .build()
@@ -170,23 +174,7 @@ impl SanitizerHttpClient {
             timeout: policy.connections.connection_timeout,
         };
 
-        let max_redirects = policy.connections.max_redirects;
-        let max_redirects_action = policy.connections.max_redirects_action;
-        let dangerous_hosts = policy
-            .urls
-            .dangerous_domains
-            .iter()
-            .map(|x| x.0.clone())
-            .collect_vec();
-        let dangerous_domain_action = policy.connections.dangerous_domain_action;
-        let idn_action = policy.urls.idn_action;
-
-        let logger = Logger {
-            path: Arc::new(PathBuf::new()),
-            index: 0,
-            max_size: 1,
-        };
-
+        let dangerous_domain_action = policy.connections.dangerous_domain;
         let client = Client::builder()
             // Set custom Ip resolver
             .dns_resolver(Arc::new(ssrf_safe_resolver))
@@ -195,22 +183,34 @@ impl SanitizerHttpClient {
             .user_agent(&policy.connections.user_agent)
             // Disable redirects
             .redirect(redirect::Policy::custom(move |attempt| {
-                let check = || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let index = url_map.lock();
+                let index = *index
+                    .get(attempt.previous().first().unwrap_or(attempt.url()))
+                    .unwrap();
+
+                let logger = (index, &channel);
+
+                let check = || -> Result<(), LoggerError> {
                     if let Some(original) = check_domain(attempt.url()) {
-                        idn_action.handle_error(&logger, IDN(original))?;
+                        policy.urls.idn.handle(&logger, IDN(original))?;
                     }
 
-                    if let Some(max_redirects) = max_redirects
-                        && attempt.previous().len() == max_redirects + 1
-                    {
-                        max_redirects_action.handle_error(&logger, TooManyRedirects)?;
+                    if attempt.previous().len() == policy.connections.max_redirects.value + 1 {
+                        policy
+                            .connections
+                            .max_redirects
+                            .handle(&logger, TooManyRedirects)?;
                     }
 
                     if let Some(host) = attempt.url().host().map(|x| x.to_owned())
-                        && dangerous_hosts.iter().any(|x| host.matches(x))
+                        && policy
+                            .urls
+                            .dangerous_domains
+                            .iter()
+                            .any(|x| host.matches(&x.0))
                     {
                         dangerous_domain_action
-                            .handle_error(&logger, DangerousDomain(host.to_owned()))?;
+                            .handle(&logger, DangerousDomain(host.to_owned()))?;
                     }
 
                     Ok(())
@@ -227,87 +227,6 @@ impl SanitizerHttpClient {
             .context("Failed to build reqwest client")?;
 
         Ok(Self { client })
-    }
-
-    /// Fetch a single URL and write its rewritten HTML stream directly to `output` file.
-    ///
-    /// # Inputs
-    /// * `url` - The remote URL to fetch.
-    /// * `logger` - The logging interface.
-    /// * `output` - The file handle to stream the rewritten HTML bytes into.
-    /// * `policy` - The security policy configuration.
-    ///
-    /// # Returns
-    /// * `Result<FetchedContent>` - An empty data `FetchedContent` struct on success, or an error if fetch/rewrite limits are exceeded.
-    #[allow(dead_code)]
-    pub async fn fetch_one_url(
-        &self,
-        url: &Url,
-        logger: &Logger,
-        output: File,
-        policy: &Policy,
-    ) -> Result<FetchedContent> {
-        if url.scheme() != "https" {
-            return Err(anyhow!("Only HTTPS URLs are permitted"));
-        }
-
-        let response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .with_context(|| format!("Request failed for URL: {}", url))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Server returned error status: {}",
-                response.status()
-            ));
-        }
-
-        let max_bytes = policy.resources.max_bytes;
-
-        // Fast-fail for `Content-Length` header
-        if let Some(length) = response
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|x| x.to_str().ok())
-            .and_then(|x| x.parse::<usize>().ok())
-            && length > max_bytes
-        {
-            return Err(ContentTooLong(max_bytes).into());
-        }
-
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Stream body with byte limit to prevent memory exhaustion
-        let mut stream = response.bytes_stream();
-        let mut length = 0;
-
-        let mut rewriter = create_rewriter(logger, policy, None, output);
-
-        while let Some(item) = stream.next().await {
-            let chunk = item.context("Error while streaming body")?;
-
-            length += chunk.len();
-            if length > max_bytes {
-                return Err(ContentTooLong(max_bytes).into());
-            }
-
-            rewriter.write(&chunk)?;
-        }
-
-        rewriter.end()?;
-
-        Ok(FetchedContent {
-            source: InputSource::Url(url.clone()),
-            data: Vec::new(),
-            content_type,
-        })
     }
 
     /// Fetch raw bytes of a URL with security controls, enforcing max_bytes limit on the current request.
@@ -383,15 +302,21 @@ impl SanitizerHttpClient {
     }
 
     /// Fetch a single HTML URL, sanitize/rewrite it, and collect discovered subresources.
+    ///
+    /// # Inputs
+    /// * `url` - The remote URL to fetch.
+    /// * `logger` - The logging interface.
+    /// * `output` - The file handle to stream the rewritten HTML bytes into.
+    /// * `policy` - The security policy configuration.
     pub async fn fetch_and_sanitize_html(
         &self,
         url: &Url,
         logger: &Logger,
-        output_path: &PathBuf,
+        output_path: &Path,
         policy: &Policy,
-    ) -> Result<(Url, Vec<(Url, String)>)> {
+    ) -> Result<CrawlerState, LoggerError> {
         if url.scheme() != "https" {
-            return Err(anyhow!("Only HTTPS URLs are permitted"));
+            return Err(anyhow!("Only HTTPS URLs are permitted").into());
         }
 
         let response = self
@@ -402,20 +327,24 @@ impl SanitizerHttpClient {
             .with_context(|| format!("Request failed for URL: {}", url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("Server returned error status: {}", response.status()));
+            return Err(anyhow!("Server returned error status: {}", response.status()).into());
         }
 
         let max_bytes = policy.resources.max_bytes;
 
-        // Content-Length check for HTML
+        // Avoids logging the error more than once
+        let mut already_too_long = false;
+
+        // Fast-fail for `Content-Length` header
         if let Some(length) = response
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|x| x.to_str().ok())
             .and_then(|x| x.parse::<usize>().ok())
-            && length > max_bytes
+            && length > max_bytes.value
         {
-            return Err(ContentTooLong(max_bytes).into());
+            max_bytes.handle(logger, ContentTooLong(max_bytes.value))?;
+            already_too_long = true;
         }
 
         let content_type = response
@@ -430,83 +359,44 @@ impl SanitizerHttpClient {
             .unwrap_or(true);
 
         if !is_html {
-            return Err(anyhow!("Root URL did not return HTML content type"));
+            return Err(anyhow!("Root URL did not return HTML content type").into());
         }
 
         let mut stream = response.bytes_stream();
         let mut total_bytes = 0;
 
-        let base_url = Arc::new(Mutex::new(url.clone()));
-        let sub_resources = Arc::new(Mutex::new(Vec::new()));
+        let mut crawler_state = CrawlerState {
+            base: url.clone(),
+            subresources: Vec::new(),
+        };
 
-        let file = File::create(output_path)?;
         let mut rewriter = create_rewriter(
             logger,
             policy,
-            Some((Arc::clone(&base_url), Arc::clone(&sub_resources))),
-            file,
+            &mut crawler_state,
+            File::create(output_path)?,
         );
 
         while let Some(item) = stream.next().await {
-            let chunk = item.context("Error while streaming HTML body")?;
+            let chunk = item.context("Error while streaming body")?;
+
             total_bytes += chunk.len();
-            
-            if total_bytes > max_bytes {
-                return Err(ContentTooLong(max_bytes).into());
+            if !already_too_long && total_bytes > max_bytes.value {
+                max_bytes.handle(logger, ContentTooLong(max_bytes.value))?;
+                already_too_long = true;
             }
-            
-            rewriter.write(&chunk)?;
+
+            rewriter.write(&chunk).map_err(|e| match e {
+                // Extract the error returned inside the `element!()` macro
+                RewritingError::ContentHandlerError(e) => e,
+                e => e.into(),
+            })?;
         }
-        
+
         rewriter.end()?;
 
-        let final_base = {
-            let guard = base_url.lock().unwrap();
-            guard.clone()
-        };
-        let discovered = {
-            let guard = sub_resources.lock().unwrap();
-            guard.clone()
-        };
-
-        Ok((final_base, discovered))
+        Ok(crawler_state)
     }
-}
-
-
-/*================== MAIN FUNCTIONS ===================*/
-
-/// Fetch multiple URLs and return their content (deprecated helper).
-///
-/// # Inputs
-/// * `sources` - Vector of InputSources to fetch.
-/// * `policy` - The security policy configuration.
-///
-/// # Returns
-/// * `Result<(Vec<FetchedContent>, Vec<anyhow::Error>)>` - A tuple containing fetched contents and encountered errors.
-#[allow(dead_code)]
-pub async fn fetch_multiple_urls(
-    sources: Vec<InputSource>,
-    policy: &Policy,
-) -> Result<(Vec<FetchedContent>, Vec<anyhow::Error>)> {
-    let mut results_vec = Vec::new();
-    let mut errors_vec = Vec::<anyhow::Error>::new();
-
-    let client = SanitizerHttpClient::new(policy).await?;
-
-    for input_source in sources {
-        // if let InputSource::Url(url) = input_source {
-        //     match client.fetch_one_url(&url, policy).await {
-        //         Ok(res) => results_vec.push(res),
-        //         Err(e) => errors_vec.push(anyhow!(
-        //             "Could not fetch url {}: {}",
-        //             url,
-        //             e.source().unwrap().source().unwrap()
-        //         )),
-        //     }
-        // }
-    }
-    Ok((results_vec, errors_vec))
 }
 
 /*================== TESTS ===================*/

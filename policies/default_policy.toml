@@ -1,0 +1,39 @@
+[logging]
+console = "info"
+files = "trace"
+
+[html]
+allow_scripts = []
+allow_origins = ["trusted.com"]
+event_handlers = "warn"
+
+# [html.dangerous_domain]
+# level = "info"
+# replace = "#"
+
+[urls]
+dangerous_domains = [
+  "malicious-domain.com",
+  "evil.com",
+  "iana.org",
+  "developers.google.com",
+  "com.google.android.youtube",
+  # "www.youtube.com",
+]
+idn = "warn"
+
+[resources]
+fetch_sub_resources = true
+max_depth = 10
+max_requests = { value = 10, level = "warn" }
+max_bytes = { value = 2048, level = "warn" }
+
+[connections]
+connection_timeout = "3s"
+overall_timeout = "15s"
+max_redirects = {
+  value = 10,
+  level = "warn"
+}
+user_agent = "CoolBot/0.0 (https://example.org/coolbot/; coolbot@example.org) generic-library/0.0"
+dangerous_domain = "warn"

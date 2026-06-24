@@ -11,7 +11,6 @@ hickory-resolver = { version = "0.26.1", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 itertools = "0.14.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
@@ -20,6 +19,10 @@ walkdir = "2.5.0"
 humantime-serde = "1.1.1"
 colored = "3.1.1"
 lol_html = "2.9.0"
+strip-ansi-escapes = "0.2.1"
+chrono = "0.4.44"
+toml = "1.1.2"
+parking_lot = "0.12.5"
 
 [patch.crates-io]
 form_urlencoded = { git = "https://github.com/psyvern/rust-url.git" }
