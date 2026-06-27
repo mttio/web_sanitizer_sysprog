@@ -5,6 +5,7 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::Colorize;
 use std::fs::{self};
 use web_sanitizer_sysprog::engine_structs::InputSource;
 use web_sanitizer_sysprog::log::logging_thread;
@@ -17,7 +18,6 @@ use walkdir::WalkDir;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    println!("Successfully parsed args: {:?}", args);
 
     if args.generate_policy {
         let string = toml::to_string_pretty(&Policy::default())
@@ -26,22 +26,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    println!(r#"
+    println!("{}", r#"
     ____                  __                  
    / __ \___  ____  ___  / /___  ____  ___    
   / /_/ / _ \/ __ \/ _ \/ / __ \/ __ \/ _ \   
  / ____/  __/ / / /  __/ / /_/ / /_/ /  __/   
 /_/    \___/_/ /_/\___/_/\____/ .___/\___/    
                              /_/              
-"#);
-    println!("======= WELCOME TO THE PENELOPE WEB SANITIZER CLI INTERFACE =======");
+"#.cyan().bold());
+    println!("{}", "✨ Welcome to the Penelope Web Sanitizer CLI Interface ✨".bright_blue().bold());
+    println!("{}", "==========================================================".bright_blue());
 
     //run cli application
     if let Err(e) = run(args) {
-        eprintln!("Application error: {:?}", e);
+        eprintln!("{} {:?}", "Application error:".red().bold(), e);
     }
 
-    println!("======================== GOODBYE =========================");
+    println!("{}", "======================== GOODBYE =========================".bright_black().bold());
     Ok(())
 }
 
@@ -143,14 +144,27 @@ fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
 /// * `Result<()>` - `Ok(())` on successful completion, or an error if initialization fails.
 pub fn run(args: Args) -> Result<()> {
     let policy = load_policy(args.policy.as_ref())?;
+    
+    // Print argument summary
+    println!("\n{}", "⚙️  ACTIVE CONFIGURATION SUMMARY:".bright_blue().bold());
+    println!("  📂 {} {:?}", "Inputs:".bright_blue(), args.inputs);
+    println!("  ⚙️   {} {}", "Policy:".bright_blue(), match &args.policy {
+        Some(p) => format!("{:?}", p),
+        None => "Default Embedded Policy".to_owned()
+    });
+    println!("  📦 {} {:?}", "Output Dir:".bright_blue(), args.output_dir);
+    println!("  🧵 {} {}", "Workers:".bright_blue(), args.workers.to_string().yellow());
+    println!("");
+
     let sources = parse_inputs(args.inputs)?;
 
     if sources.is_empty() {
-        println!("No valid inputs provided.");
+        println!("{}", "⚠️  No valid inputs provided.".yellow());
         return Ok(());
     }
 
-    // Ensure output directory is empty and exists
+    // Step 1: Clean output directory
+    println!("{}", "[1/3] 🧹 Cleaning output folder...".bright_black().bold());
     if args.output_dir.exists() {
         fs::remove_dir_all(&args.output_dir)
             .with_context(|| format!("Failed to empty output directory: {:?}", args.output_dir))?;
@@ -158,11 +172,8 @@ pub fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("Failed to create output directory: {:?}", args.output_dir))?;
 
-    println!(
-        "Successfully created output directory: {:?}",
-        args.output_dir
-    );
-
+    // Step 2: Initialize parallel pipeline
+    println!("{}", "[2/3] 🚀 Initializing parallel sanitization pipeline...".bright_black().bold());
     let (tx, rx) = std::sync::mpsc::channel();
 
     let policy = Arc::new(policy);
@@ -175,15 +186,26 @@ pub fn run(args: Args) -> Result<()> {
     let output_dir = Arc::new(args.output_dir);
     let max_size = sources.len();
 
-    web_sanitizer_sysprog::library(
+    // Step 3: Run and log
+    println!("{}", "[3/3] 📊 Processing inputs & streaming logs...".bright_black().bold());
+    let library_result = web_sanitizer_sysprog::library(
         &runtime,
         sources,
         Arc::clone(&policy),
         Arc::clone(&output_dir),
         tx,
-    )?;
+    );
 
-    logging_thread(&output_dir, &policy, max_size, rx);
+    match library_result {
+        Ok(_) => {
+            logging_thread(&output_dir, &policy, max_size, rx);
+            println!("\n{}", "✨ Execution complete! Checked files have been processed.".bright_blue().bold());
+        }
+        Err(e) => {
+            println!("\n{}", "❌ Sanitization failed with error:".red().bold());
+            return Err(e);
+        }
+    }
 
     Ok(())
 }
