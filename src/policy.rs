@@ -68,6 +68,8 @@ pub struct HtmlPolicy {
     pub event_handlers: RuleWithReplace<String>,
     /// Action to perform when a dangerous domain is encountered
     pub dangerous_domain: RuleWithReplace<String>,
+    /// Action to perform when a dangerous URI (javascript:, data:) is encountered
+    pub dangerous_uris: RuleWithReplace<String>,
 }
 
 impl Default for HtmlPolicy {
@@ -81,6 +83,7 @@ impl Default for HtmlPolicy {
                 .collect(),
             event_handlers: RuleWithReplace::new("".to_owned(), LogLevel::Info),
             dangerous_domain: RuleWithReplace::new("#".to_owned(), LogLevel::Error),
+            dangerous_uris: RuleWithReplace::new("#".to_owned(), LogLevel::Info),
         }
     }
 }

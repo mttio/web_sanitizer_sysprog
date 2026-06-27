@@ -32,6 +32,15 @@ pub enum SanitizerError {
         }        
     )]
     EventHandler(String, Option<usize>),
+    #[error(
+        "dangerous URI ({}){}",
+        .0.bright_cyan(),
+        match .1 {
+            Some(x) => format!(" @ {}", x.to_string().bright_magenta()),
+            None => "".to_owned(),
+        }
+    )]
+    DangerousUri(String, Option<usize>),
     #[error("IDN url ({})", .0)]
     Idn(String),
     #[error(

@@ -142,6 +142,33 @@ pub fn create_rewriter<'a, W: Write>(
                         )??;
                     }
                 }
+
+                if !policy.html.dangerous_uris.is_ignore() {
+                    let dangerous_uri_attrs: Vec<(String, String)> = el.attributes()
+                        .iter()
+                        .map(|attr| (attr.name(), attr.value()))
+                        .filter(|(_, val)| {
+                            let val_trimmed = val.trim().to_lowercase();
+                            val_trimmed.starts_with("javascript:") || val_trimmed.starts_with("data:")
+                        })
+                        .collect();
+
+                    for (attr_name, val) in dangerous_uri_attrs {
+                        let location = el.source_location();
+                        policy.html.dangerous_uris.handle(
+                            logger,
+                            |replacement| -> Result<(), LoggerError> {
+                                if replacement.is_empty() {
+                                    el.remove_attribute(&attr_name);
+                                } else {
+                                    el.set_attribute(&attr_name, replacement).map_err(|e| Box::new(e) as LoggerError)?;
+                                }
+                                Ok(())
+                            },
+                            SanitizerError::DangerousUri(val, Some(location.bytes().start)),
+                        )??;
+                    }
+                }
                 Ok(())
             }),
             element!(
@@ -308,6 +335,33 @@ pub fn create_rewriter<'a, W: Write>(
                                 Ok(())
                             },
                             SanitizerError::EventHandler(attr_name.clone(), Some(location.bytes().start)),
+                        )??;
+                    }
+                }
+
+                if !policy.html.dangerous_uris.is_ignore() {
+                    let dangerous_uri_attrs: Vec<(String, String)> = el.attributes()
+                        .iter()
+                        .map(|attr| (attr.name(), attr.value()))
+                        .filter(|(_, val)| {
+                            let val_trimmed = val.trim().to_lowercase();
+                            val_trimmed.starts_with("javascript:") || val_trimmed.starts_with("data:")
+                        })
+                        .collect();
+
+                    for (attr_name, val) in dangerous_uri_attrs {
+                        let location = el.source_location();
+                        policy.html.dangerous_uris.handle(
+                            logger,
+                            |replacement| -> Result<(), LoggerError> {
+                                if replacement.is_empty() {
+                                    el.remove_attribute(&attr_name);
+                                } else {
+                                    el.set_attribute(&attr_name, replacement).map_err(|e| Box::new(e) as LoggerError)?;
+                                }
+                                Ok(())
+                            },
+                            SanitizerError::DangerousUri(val, Some(location.bytes().start)),
                         )??;
                     }
                 }
@@ -569,5 +623,74 @@ mod tests {
 
         let result = String::from_utf8(output).unwrap();
         assert!(!result.contains("alert(1)"));
+    }
+
+    #[test]
+    fn test_dangerous_uris_sanitization() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.dangerous_uris = crate::rules::RuleWithReplace::new("#".to_owned(), crate::log::LogLevel::Info);
+
+        let input_html = b"<a href=\"javascript:alert(1)\" src=\"  data:text/html,malicious  \" data-url=\"other\">link</a>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("href=\"#\""));
+        assert!(result.contains("src=\"#\""));
+        assert!(result.contains("data-url=\"other\""));
+    }
+
+    #[test]
+    fn test_dangerous_uris_bypass_whitespace() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.dangerous_uris = crate::rules::RuleWithReplace::new("".to_owned(), crate::log::LogLevel::Info);
+
+        let input_html = b"<a href=\"\n\t javascript:alert(1)\">link</a>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(!result.contains("javascript"));
+        assert!(!result.contains("href="));
+    }
+
+    #[test]
+    fn test_dangerous_uris_ignore() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.dangerous_uris = crate::rules::RuleWithReplace::new("#".to_owned(), crate::log::LogLevel::Ignore);
+
+        let input_html = b"<a href=\"javascript:alert(1)\">link</a>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("href=\"javascript:alert(1)\""));
     }
 }
