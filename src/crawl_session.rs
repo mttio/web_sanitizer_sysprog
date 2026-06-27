@@ -248,6 +248,47 @@ impl CrawlSession {
                 self.logger.log(LogLevel::Error, error);
             }
             return;
+        } else if extension == "css" {
+            let output_path = self.output_dir.join(format!("{}.css", self.index()));
+            let result = || -> Result<()> {
+                let data = fs::read(&path)
+                    .with_context(|| format!("Failed to read local CSS file {:?}", path))?;
+                let css_str = String::from_utf8_lossy(&data);
+                let dummy_url = Url::parse("https://localhost").unwrap();
+                let (sanitized_css, _) = crate::resources::sanitize_css(&css_str, &dummy_url);
+                fs::write(&output_path, sanitized_css.as_bytes())
+                    .with_context(|| format!("Failed to write local CSS to {:?}", output_path))?;
+                Ok(())
+            }();
+
+            if let Err(error) = result {
+                self.logger.log(LogLevel::Error, error);
+            }
+            return;
+        } else if extension == "js" {
+            let output_path = self.output_dir.join(format!("{}.js", self.index()));
+            let result = || -> Result<()> {
+                let data = fs::read(&path)
+                    .with_context(|| format!("Failed to read local JS file {:?}", path))?;
+                let js_str = String::from_utf8_lossy(&data);
+                match crate::resources::sanitize_javascript(&js_str) {
+                    Ok(clean_js) => {
+                        fs::write(&output_path, clean_js.as_bytes())
+                            .with_context(|| format!("Failed to write local JS to {:?}", output_path))?;
+                    }
+                    Err(err) => {
+                        self.logger.warn(anyhow!("JS validation failed for direct input {:?}: {}", path, err));
+                        fs::write(&output_path, b"/* Blocked by Web Sanitizer: dangerous keywords found */")
+                            .with_context(|| format!("Failed to write local JS to {:?}", output_path))?;
+                    }
+                }
+                Ok(())
+            }();
+
+            if let Err(error) = result {
+                self.logger.log(LogLevel::Error, error);
+            }
+            return;
         }
 
         let output_path = self.output_dir.join(format!("{}.html", self.index()));

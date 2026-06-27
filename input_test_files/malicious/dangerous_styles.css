@@ -1,0 +1,4 @@
+body {
+    background-image: url("javascript:alert('CSS XSS')");
+    color: red;
+}

@@ -577,5 +577,13 @@ mod tests {
 
         let malicious_file_data = std::fs::read("input_test_files/malicious/pdf_js_bomb.pdf").unwrap();
         assert!(scan_pdf_for_active_content(&malicious_file_data).is_err());
+
+        // CSS and JS disk file validation checks
+        let css_file_data = std::fs::read_to_string("input_test_files/malicious/dangerous_styles.css").unwrap();
+        let (clean_css, _) = sanitize_css(&css_file_data, &Url::parse("https://localhost").unwrap());
+        assert!(clean_css.contains("url(\"\")"));
+
+        let js_file_data = std::fs::read_to_string("input_test_files/malicious/dangerous_script.js").unwrap();
+        assert!(sanitize_javascript(&js_file_data).is_err());
     }
 }
