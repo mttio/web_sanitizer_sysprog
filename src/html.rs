@@ -5,7 +5,7 @@ use lol_html::{
 use std::io::Write;
 use url::Url;
 
-use crate::sanitizer_engine::{
+use crate::{
     errors::{DangerousDomainInHtml, LoggerError},
     log::Logger,
     policy::Policy,
@@ -161,7 +161,10 @@ pub fn create_rewriter<'a, W: Write>(
                                     "script" => "js",
                                     _ => "png",
                                 };
-                                let local_name = crate::sanitizer_engine::resource_sanitizer::generate_local_filename(&resolved_url, default_ext);
+                                let local_name = crate::resource_sanitizer::generate_local_filename(
+                                    &resolved_url,
+                                    default_ext,
+                                );
 
                                 el.set_attribute(attr_name, &local_name)?;
                                 state.subresources.push((resolved_url, local_name));

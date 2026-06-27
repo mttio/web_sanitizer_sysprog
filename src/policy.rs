@@ -1,9 +1,9 @@
 use std::{fmt::Debug, time::Duration};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Host;
 
-use crate::sanitizer_engine::{
+use crate::{
     log::LogLevel,
     rules::{RuleWithReplace, RuleWithValue},
 };
@@ -23,7 +23,16 @@ impl<'de> Deserialize<'de> for PolicyHost {
     }
 }
 
-#[derive(Debug, Deserialize)]
+impl Serialize for PolicyHost {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Logging {
     /// Minimum log level to write on log files
     pub files: LogLevel,
@@ -40,7 +49,7 @@ impl Default for Logging {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Policy {
     pub logging: Logging,
@@ -50,7 +59,7 @@ pub struct Policy {
     pub connections: ConnectionsPolicy,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HtmlPolicy {
     pub allow_scripts: Vec<String>,
@@ -76,7 +85,7 @@ impl Default for HtmlPolicy {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UrlsPolicy {
     /// List of domains considered dangerous
@@ -99,7 +108,7 @@ impl Default for UrlsPolicy {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ResourcesPolicy {
     pub fetch_sub_resources: bool,
@@ -119,7 +128,7 @@ impl Default for ResourcesPolicy {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConnectionsPolicy {
     #[serde(with = "humantime_serde")]

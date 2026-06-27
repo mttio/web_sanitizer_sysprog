@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::sanitizer_engine::{
+use crate::{
     errors::LoggerError,
     log::{LogLevel, LoggerTrait},
 };
@@ -13,7 +13,7 @@ use crate::sanitizer_engine::{
 /// rule = [value, "level"] # both replacement value and log level
 /// rule = { value = ..., level = ... } # both replacement value and log level
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RuleWithReplace<R: Default> {
     replace: R,
     level: LogLevel,
@@ -63,7 +63,7 @@ impl<'de, R: Default + Deserialize<'de>> Deserialize<'de> for RuleWithReplace<R>
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Serialize)]
 pub struct RuleWithValue<T: 'static> {
     pub value: T,
     pub level: LogLevel,

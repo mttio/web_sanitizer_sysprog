@@ -1,11 +1,11 @@
-use crate::sanitizer_engine::engine_structs::{FetchedContent, InputSource};
-use crate::sanitizer_engine::errors::{
+use crate::engine_structs::{FetchedContent, InputSource};
+use crate::errors::{
     ContentTooLong, DangerousDomain, IDN, LoggerError, TimeoutError, TooManyRedirects,
 };
-use crate::sanitizer_engine::html::{CrawlerState, create_rewriter};
-use crate::sanitizer_engine::log::{Logger, LoggerMessage};
-use crate::sanitizer_engine::policy::Policy;
-use crate::sanitizer_engine::url::{RuleMatch, check_domain};
+use crate::html::{CrawlerState, create_rewriter};
+use crate::log::{Logger, LoggerMessage};
+use crate::policy::Policy;
+use crate::url::{RuleMatch, check_domain};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};

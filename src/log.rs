@@ -6,10 +6,10 @@ use std::{error::Error, fs::File};
 use chrono::Local;
 use colored::Colorize;
 use itertools::Itertools;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::sanitizer_engine::errors::LoggerError;
-use crate::sanitizer_engine::policy::Policy;
+use crate::errors::LoggerError;
+use crate::policy::Policy;
 
 pub trait LoggerTrait {
     fn log<E: Into<LoggerError>>(&self, level: LogLevel, error: E);
@@ -45,7 +45,7 @@ pub struct Logger {
     pub channel: Sender<LoggerMessage>,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Trace,
