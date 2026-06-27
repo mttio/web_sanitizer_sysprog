@@ -112,18 +112,22 @@ impl Default for UrlsPolicy {
 #[serde(default)]
 pub struct ResourcesPolicy {
     pub fetch_sub_resources: bool,
-    pub max_depth: usize,
+    pub max_depth: RuleWithValue<usize>,
     pub max_bytes: RuleWithValue<usize>,
     pub max_requests: RuleWithValue<usize>,
+    pub mismatched_mime: LogLevel,
+    pub unknown_resource: LogLevel,
 }
 
 impl Default for ResourcesPolicy {
     fn default() -> Self {
         Self {
             fetch_sub_resources: true,
-            max_depth: 1,
+            max_depth: RuleWithValue::new(1, LogLevel::Error),
             max_bytes: RuleWithValue::new(1024 * 1024, LogLevel::Error),
             max_requests: RuleWithValue::new(5, LogLevel::Error),
+            mismatched_mime: LogLevel::Error,
+            unknown_resource: LogLevel::Error,
         }
     }
 }

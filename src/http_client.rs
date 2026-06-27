@@ -1,7 +1,5 @@
 use crate::engine_structs::{FetchedContent, InputSource};
-use crate::errors::{
-    ContentTooLong, DangerousDomain, IDN, LoggerError, TimeoutError, TooManyRedirects,
-};
+use crate::errors::{LoggerError, SanitizerError};
 use crate::html::{CrawlerState, create_rewriter};
 use crate::log::{Logger, LoggerMessage};
 use crate::policy::Policy;
@@ -11,7 +9,6 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use hickory_resolver::TokioResolver;
-use lol_html::errors::RewritingError;
 use parking_lot::Mutex;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, header, redirect};
@@ -123,8 +120,8 @@ impl Resolve for SsrfSafeDnsResolver {
             // setting independent timeout on DNS resolution
             let lookup = tokio::time::timeout(timeout, inner.lookup_ip(&host))
                 .await
-                .map_err(|_| TimeoutError(host.clone()))?
-                .map_err(|e| format!("DNS lookup failed for host {}: {}", host, e))?;
+                .map_err(|_| SanitizerError::Timeout(host.clone()))?
+                .map_err(|e| SanitizerError::DnsLookup(host.clone(), e))?;
 
             // Filter to safe IPs only;
             // reqwest automatically replaces port 0 with the Url's actual port when connecting
@@ -192,14 +189,18 @@ impl SanitizerHttpClient {
 
                 let check = || -> Result<(), LoggerError> {
                     if let Some(original) = check_domain(attempt.url()) {
-                        policy.urls.idn.handle(&logger, IDN(original))?;
+                        policy
+                            .urls
+                            .idn
+                            .handle(&logger, SanitizerError::Idn(original))?;
                     }
 
-                    if attempt.previous().len() == policy.connections.max_redirects.value + 1 {
-                        policy
-                            .connections
-                            .max_redirects
-                            .handle(&logger, TooManyRedirects)?;
+                    let max_redirects = policy.connections.max_redirects;
+                    if attempt.previous().len() == max_redirects.value + 1 {
+                        max_redirects.handle(
+                            &logger,
+                            SanitizerError::TooManyRedirects(max_redirects.value),
+                        )?;
                     }
 
                     if let Some(host) = attempt.url().host().map(|x| x.to_owned())
@@ -210,7 +211,7 @@ impl SanitizerHttpClient {
                             .any(|x| host.matches(&x.0))
                     {
                         dangerous_domain_action
-                            .handle(&logger, DangerousDomain(host.to_owned()))?;
+                            .handle(&logger, SanitizerError::DangerousDomain(host.to_owned()))?;
                     }
 
                     Ok(())
@@ -245,9 +246,9 @@ impl SanitizerHttpClient {
         _logger: &Logger,
         _policy: &Policy,
         remaining_bytes: usize,
-    ) -> Result<FetchedContent> {
+    ) -> Result<FetchedContent, SanitizerError> {
         if url.scheme() != "https" {
-            return Err(anyhow!("Only HTTPS URLs are permitted"));
+            return Err(SanitizerError::NonHttpsUrl);
         }
 
         let response = self
@@ -258,10 +259,7 @@ impl SanitizerHttpClient {
             .with_context(|| format!("Request failed for URL: {}", url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow!(
-                "Server returned error status: {}",
-                response.status()
-            ));
+            return Err(anyhow!("Server returned error status: {}", response.status()).into());
         }
 
         // Fast-fail for `Content-Length` header
@@ -272,7 +270,7 @@ impl SanitizerHttpClient {
             .and_then(|x| x.parse::<usize>().ok())
             && length > remaining_bytes
         {
-            return Err(ContentTooLong(remaining_bytes).into());
+            return Err(SanitizerError::ContentTooLong(remaining_bytes));
         }
 
         let content_type = response
@@ -289,7 +287,7 @@ impl SanitizerHttpClient {
             let chunk = item.context("Error while streaming body")?;
             length += chunk.len();
             if length > remaining_bytes {
-                return Err(ContentTooLong(remaining_bytes).into());
+                return Err(SanitizerError::ContentTooLong(remaining_bytes));
             }
             data.extend_from_slice(&chunk);
         }
@@ -314,9 +312,9 @@ impl SanitizerHttpClient {
         logger: &Logger,
         output_path: &Path,
         policy: &Policy,
-    ) -> Result<CrawlerState, LoggerError> {
+    ) -> Result<CrawlerState, SanitizerError> {
         if url.scheme() != "https" {
-            return Err(anyhow!("Only HTTPS URLs are permitted").into());
+            return Err(SanitizerError::NonHttpsUrl);
         }
 
         let response = self
@@ -343,7 +341,7 @@ impl SanitizerHttpClient {
             .and_then(|x| x.parse::<usize>().ok())
             && length > max_bytes.value
         {
-            max_bytes.handle(logger, ContentTooLong(max_bytes.value))?;
+            max_bytes.handle(logger, SanitizerError::ContentTooLong(max_bytes.value))?;
             already_too_long = true;
         }
 
@@ -374,7 +372,7 @@ impl SanitizerHttpClient {
             logger,
             policy,
             &mut crawler_state,
-            File::create(output_path)?,
+            File::create(output_path).map_err(|e| anyhow!("{e}"))?,
         );
 
         while let Some(item) = stream.next().await {
@@ -382,15 +380,11 @@ impl SanitizerHttpClient {
 
             total_bytes += chunk.len();
             if !already_too_long && total_bytes > max_bytes.value {
-                max_bytes.handle(logger, ContentTooLong(max_bytes.value))?;
+                max_bytes.handle(logger, SanitizerError::ContentTooLong(max_bytes.value))?;
                 already_too_long = true;
             }
 
-            rewriter.write(&chunk).map_err(|e| match e {
-                // Extract the error returned inside the `element!()` macro
-                RewritingError::ContentHandlerError(e) => e,
-                e => e.into(),
-            })?;
+            rewriter.write(&chunk)?;
         }
 
         rewriter.end()?;

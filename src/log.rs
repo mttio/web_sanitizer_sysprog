@@ -1,42 +1,42 @@
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
-use std::{error::Error, fs::File};
 
 use chrono::Local;
 use colored::Colorize;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::errors::LoggerError;
+use crate::errors::SanitizerMessage;
 use crate::policy::Policy;
 
 pub trait LoggerTrait {
-    fn log<E: Into<LoggerError>>(&self, level: LogLevel, error: E);
+    fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T);
 
     #[inline]
-    fn trace<E: Into<LoggerError>>(&self, error: E) {
-        self.log(LogLevel::Trace, error);
+    fn trace<T: Into<SanitizerMessage>>(&self, message: T) {
+        self.log(LogLevel::Trace, message);
     }
 
     #[inline]
-    fn debug<E: Into<LoggerError>>(&self, error: E) {
-        self.log(LogLevel::Debug, error);
+    fn debug<T: Into<SanitizerMessage>>(&self, message: T) {
+        self.log(LogLevel::Debug, message);
     }
 
     #[inline]
-    fn info<E: Into<LoggerError>>(&self, error: E) {
-        self.log(LogLevel::Info, error);
+    fn info<T: Into<SanitizerMessage>>(&self, message: T) {
+        self.log(LogLevel::Info, message);
     }
 
     #[inline]
-    fn warn<E: Into<LoggerError>>(&self, error: E) {
-        self.log(LogLevel::Warn, error);
+    fn warn<T: Into<SanitizerMessage>>(&self, message: T) {
+        self.log(LogLevel::Warn, message);
     }
 
     #[inline]
-    fn error<E: Into<LoggerError>>(&self, error: E) {
-        self.log(LogLevel::Error, error);
+    fn error<T: Into<SanitizerMessage>>(&self, message: T) {
+        self.log(LogLevel::Error, message);
     }
 }
 
@@ -56,40 +56,40 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// Returns `Err` if `self == Error`, otherwise returns `Ok` and logs the error message
-    pub fn handle<E: Into<LoggerError>>(
+    /// Returns `Err` if `self == Error`, otherwise returns `Ok` and logs the message
+    pub fn handle<T: Into<SanitizerMessage>>(
         self,
         logger: &impl LoggerTrait,
-        error: E,
-    ) -> Result<(), E> {
+        message: T,
+    ) -> Result<(), T> {
         if self == LogLevel::Error {
-            Err(error)
+            Err(message)
         } else {
-            logger.log(self, error);
+            logger.log(self, message);
             Ok(())
         }
     }
 }
 
 impl LoggerTrait for Logger {
-    fn log<E: Into<LoggerError>>(&self, level: LogLevel, error: E) {
+    fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T) {
         self.channel
             .send(LoggerMessage {
                 source: self.index,
                 level,
-                error: error.into(),
+                message: message.into(),
             })
             .unwrap();
     }
 }
 
 impl LoggerTrait for (usize, &Sender<LoggerMessage>) {
-    fn log<E: Into<LoggerError>>(&self, level: LogLevel, error: E) {
+    fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T) {
         self.1
             .send(LoggerMessage {
                 source: self.0,
                 level,
-                error: error.into(),
+                message: message.into(),
             })
             .unwrap();
     }
@@ -98,7 +98,7 @@ impl LoggerTrait for (usize, &Sender<LoggerMessage>) {
 pub struct LoggerMessage {
     source: usize,
     level: LogLevel,
-    error: Box<dyn Error + Send>,
+    message: SanitizerMessage,
 }
 
 pub fn logging_thread(
@@ -114,7 +114,7 @@ pub fn logging_thread(
     let width = (max_size as f64).log10().ceil() as usize;
 
     for msg in channel {
-        let error = msg.error.to_string();
+        let error = msg.message.to_string();
 
         if msg.level >= policy.logging.console {
             println!(

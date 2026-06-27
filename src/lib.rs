@@ -22,7 +22,7 @@ pub mod html;
 pub mod http_client;
 pub mod log;
 pub mod policy;
-pub mod resource_sanitizer;
+pub mod resources;
 pub mod rules;
 pub mod url;
 

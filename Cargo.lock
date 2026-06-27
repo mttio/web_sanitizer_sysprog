@@ -2542,6 +2542,7 @@ dependencies = [
  "reqwest",
  "serde",
  "strip-ansi-escapes",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
