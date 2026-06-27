@@ -95,7 +95,7 @@ pub fn create_rewriter<'a, W: Write>(
     let element_content_handlers = if policy.resources.fetch_sub_resources {
         vec![
             element!("*", move |el| {
-                if policy.html.strip_event_handlers {
+                if !policy.html.event_handlers.is_ignore() {
                     let event_attrs: Vec<String> = el.attributes()
                         .iter()
                         .map(|attr| attr.name())
@@ -202,7 +202,7 @@ pub fn create_rewriter<'a, W: Write>(
     } else {
         vec![
             element!("*", move |el| {
-                if policy.html.strip_event_handlers {
+                if !policy.html.event_handlers.is_ignore() {
                     let event_attrs: Vec<String> = el.attributes()
                         .iter()
                         .map(|attr| attr.name())
@@ -278,8 +278,7 @@ mod tests {
     fn test_event_handler_stripping() {
         let (tx, _rx) = mpsc::channel();
         let logger = Logger { index: 0, channel: tx };
-        let mut policy = Policy::default();
-        policy.html.strip_event_handlers = true;
+        let policy = Policy::default();
 
         let input_html = b"<button onclick=\"alert(1)\" class=\"btn\" ONLOAD=\"doSomething()\">Click me</button>";
         let mut output = Vec::new();
@@ -304,7 +303,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let logger = Logger { index: 0, channel: tx };
         let mut policy = Policy::default();
-        policy.html.strip_event_handlers = true;
         policy.html.event_handlers = crate::rules::RuleWithReplace::new("alert('blocked')".to_owned(), crate::log::LogLevel::Info);
 
         let input_html = b"<button onclick=\"alert(1)\"></button>";
@@ -320,5 +318,27 @@ mod tests {
 
         let result = String::from_utf8(output).unwrap();
         assert!(result.contains("onclick=\"alert('blocked')\""));
+    }
+
+    #[test]
+    fn test_event_handler_ignore() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.event_handlers = crate::rules::RuleWithReplace::new("".to_owned(), crate::log::LogLevel::Ignore);
+
+        let input_html = b"<button onclick=\"alert(1)\"></button>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("onclick=\"alert(1)\""));
     }
 }
