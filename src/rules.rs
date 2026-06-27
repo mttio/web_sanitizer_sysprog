@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    errors::LoggerError,
+    errors::SanitizerError,
     log::{LogLevel, LoggerTrait},
 };
 
@@ -24,14 +24,14 @@ impl<R: Default> RuleWithReplace<R> {
         Self { replace, level }
     }
 
-    pub fn handle<T, F: FnOnce(&R) -> T, E: Into<LoggerError>>(
+    pub fn handle<T, F: FnOnce(&R) -> T, M: Into<SanitizerError>>(
         &self,
         logger: &impl LoggerTrait,
         replace: F,
-        error: E,
-    ) -> Result<T, E> {
+        message: M,
+    ) -> Result<T, M> {
         self.level
-            .handle(logger, error)
+            .handle(logger, message)
             .map(|_| replace(&self.replace))
     }
 }
@@ -74,12 +74,12 @@ impl<T> RuleWithValue<T> {
         Self { value, level }
     }
 
-    pub fn handle<E: Into<LoggerError>>(
+    pub fn handle<M: Into<SanitizerError>>(
         &self,
         logger: &impl LoggerTrait,
-        error: E,
-    ) -> Result<(), E> {
-        self.level.handle(logger, error)
+        message: M,
+    ) -> Result<(), M> {
+        self.level.handle(logger, message)
     }
 }
 

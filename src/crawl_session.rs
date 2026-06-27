@@ -1,6 +1,5 @@
-use crate::errors::ContentTooLong;
-use crate::errors::DangerousDomain;
-use crate::errors::IDN;
+use crate::errors::SanitizerError;
+use crate::errors::SanitizerMessage;
 use crate::html::CrawlerState;
 use crate::html::create_rewriter;
 use crate::http_client::SanitizerHttpClient;
@@ -8,13 +7,11 @@ use crate::log::LogLevel;
 use crate::log::Logger;
 use crate::log::LoggerTrait;
 use crate::policy::Policy;
-use crate::resource_sanitizer::clean_mime;
-use crate::resource_sanitizer::sanitize_css;
-use crate::resource_sanitizer::sanitize_javascript;
-use crate::resource_sanitizer::sniff_mime;
-use crate::resource_sanitizer::strip_jpeg_metadata;
-use crate::resource_sanitizer::strip_png_metadata;
-use crate::resource_sanitizer::validate_mime;
+use crate::resources::mime;
+use crate::resources::sanitize_css;
+use crate::resources::sanitize_javascript;
+use crate::resources::strip_jpeg_metadata;
+use crate::resources::strip_png_metadata;
 use crate::url::RuleMatch;
 use crate::url::check_domain;
 use anyhow::{Context, Result, anyhow};
@@ -66,60 +63,54 @@ impl CrawlSession {
     }
 
     /// Worker task fetching and sanitizing a single sub-resource URL. Recursively enqueues nested resources (like inside CSS).
-    async fn crawl_subresource(self: Arc<Self>, url: Url, local_name: String, depth: usize) {
+    async fn crawl_subresource(
+        self: &Arc<Self>,
+        url: Url,
+        local_name: String,
+        depth: usize,
+    ) -> Result<(), SanitizerError> {
         let max_depth = self.policy.resources.max_depth;
-        if depth > max_depth {
-            return;
-        }
+        let max_bytes = self.policy.resources.max_bytes;
 
-        let remaining_bytes = {
-            let max_bytes = self.policy.resources.max_bytes;
-            max_bytes.value.saturating_sub(*self.total_bytes.lock())
-        };
-
+        let remaining_bytes = max_bytes.value.saturating_sub(*self.total_bytes.lock());
         if remaining_bytes == 0 {
-            let err = ContentTooLong(self.policy.resources.max_bytes.value);
-            let _ = self.policy.resources.max_bytes.handle(&self.logger, err);
-            return;
+            max_bytes.handle(
+                &self.logger,
+                SanitizerError::ContentTooLong(max_bytes.value),
+            )?;
         }
 
-        self.logger
-            .info(anyhow!("Crawling sub-resource (depth {}): {}", depth, url));
+        self.logger.info(SanitizerMessage::CrawlingSubresource {
+            depth,
+            url: url.clone(),
+        });
 
-        let fetch_res = self
+        let fetched = self
             .client
             .fetch_raw(&url, &self.logger, &self.policy, remaining_bytes)
-            .await;
-
-        let fetched = match fetch_res {
-            Ok(f) => f,
-            Err(e) => {
-                self.logger
-                    .warn(anyhow!("Failed to fetch sub-resource {}: {}", url, e));
-                let total_bytes_val = *self.total_bytes.lock();
-                if total_bytes_val + remaining_bytes >= self.policy.resources.max_bytes.value {
-                    let err = ContentTooLong(self.policy.resources.max_bytes.value);
-                    let _ = self.policy.resources.max_bytes.handle(&self.logger, err);
-                }
-                return;
-            }
-        };
+            .await
+            .map_err(|e| SanitizerError::SubresourceFetch(url.clone(), Box::new(e)))?;
 
         {
             let mut total_bytes = self.total_bytes.lock();
             *total_bytes += fetched.data.len();
         }
 
-        let decl_type = fetched.content_type.as_deref();
-        let declared = decl_type.map(clean_mime);
-        let sniffed = sniff_mime(&fetched.data);
-        if let Err(mime_err) = validate_mime(decl_type, sniffed) {
-            self.logger
-                .warn(anyhow!("MIME validation failed for {}: {}", url, mime_err));
-            return;
+        let declared = fetched.content_type.as_deref().map(mime::clean);
+        let sniffed = mime::sniff(&fetched.data);
+        if !mime::validate(declared.as_deref(), sniffed) {
+            let err =
+                SanitizerError::MimeMismatch(declared.clone(), sniffed.map(|x| x.to_string()));
+            self.policy
+                .resources
+                .mismatched_mime
+                .handle(&self.logger, err)?;
         }
 
-        let sniffed = sniffed.or(declared.as_deref()).unwrap_or_default();
+        let sniffed = sniffed
+            .map(|x| x.to_string())
+            .or(declared)
+            .unwrap_or_default();
         let is_jpeg = sniffed == "image/jpeg"
             || url.path().ends_with(".jpg")
             || url.path().ends_with(".jpeg");
@@ -136,7 +127,7 @@ impl CrawlSession {
         } else if is_css {
             let css_str = String::from_utf8_lossy(&fetched.data);
             let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
-            if depth < max_depth {
+            if depth < max_depth.value {
                 for (n_url, n_local) in nested_urls {
                     self.try_enqueue_subresource(n_url, n_local, depth + 1);
                 }
@@ -153,22 +144,22 @@ impl CrawlSession {
                 }
             }
         } else {
+            self.policy
+                .resources
+                .unknown_resource
+                .handle(&self.logger, SanitizerError::UnknownResourceType)?;
             fetched.data.clone()
         };
 
         let sub_path = self.output_dir.join(&local_name);
-        if let Err(e) = fs::write(&sub_path, &sanitized_data) {
-            self.logger.error(anyhow!(
-                "Failed to write sub-resource to {:?}: {}",
-                sub_path,
-                e
-            ));
-        }
+        fs::write(&sub_path, &sanitized_data)
+            .map_err(|e| anyhow!("Failed to write sub-resource to {:?}: {}", sub_path, e).into())
     }
 
     /// Checks limits and registers a sub-resource URL, then enqueues it if valid and not visited.
     fn try_enqueue_subresource(self: &Arc<Self>, url: Url, local_name: String, depth: usize) {
         let max_requests = self.policy.resources.max_requests;
+        let max_depth = self.policy.resources.max_depth;
 
         {
             let mut visited = self.url_map.lock();
@@ -183,10 +174,7 @@ impl CrawlSession {
                 if *total_requests == max_requests.value + 1 {
                     self.logger.log(
                         max_requests.level,
-                        anyhow!(
-                            "Sub-resource crawl limit reached: max_requests = {}",
-                            max_requests.value
-                        ),
+                        SanitizerError::MaxSubresources(max_requests.value),
                     );
                 }
 
@@ -196,9 +184,22 @@ impl CrawlSession {
             visited.insert(url.clone(), self.index());
         }
 
+        if depth > max_depth.value {
+            if let Err(e) = max_depth.handle(
+                &self.logger,
+                SanitizerError::MaxSubresourceDepth(max_depth.value),
+            ) {
+                self.logger.error(e);
+                return;
+            }
+        }
+
         let clone = Arc::clone(self);
-        self.rt_handle
-            .spawn(async move { clone.crawl_subresource(url, local_name, depth).await });
+        self.rt_handle.spawn(async move {
+            if let Err(e) = clone.crawl_subresource(url, local_name, depth).await {
+                clone.logger.error(e);
+            }
+        });
     }
 
     /// Worker task processing a local HTML file. Parses HTML, rewrites links, and enqueues referenced sub-resources.
@@ -229,13 +230,9 @@ impl CrawlSession {
                 if n == 0 {
                     break;
                 }
-                rewriter
-                    .write(&buffer[..n])
-                    .map_err(|e| anyhow!("Rewriter write error: {:?}", e))?;
+                rewriter.write(&buffer[..n])?;
             }
-            rewriter
-                .end()
-                .map_err(|e| anyhow!("Rewriter end error: {:?}", e))?;
+            rewriter.end()?;
 
             Ok(crawler_state.subresources)
         }();
@@ -253,7 +250,11 @@ impl CrawlSession {
     /// Worker task fetching a remote HTML document, sanitizing it, and enqueuing referenced sub-resources.
     pub async fn process_url(self: Arc<Self>, url: Url) {
         if let Some(original) = check_domain(&url)
-            && let Err(e) = self.policy.urls.idn.handle(&self.logger, IDN(original))
+            && let Err(e) = self
+                .policy
+                .urls
+                .idn
+                .handle(&self.logger, SanitizerError::Idn(original))
         {
             self.logger.error(e);
             return;
@@ -266,11 +267,10 @@ impl CrawlSession {
                 .dangerous_domains
                 .iter()
                 .any(|x| host.matches(&x.0))
-            && let Err(e) = self
-                .policy
-                .connections
-                .dangerous_domain
-                .handle(&self.logger, DangerousDomain(host.to_owned()))
+            && let Err(e) = self.policy.connections.dangerous_domain.handle(
+                &self.logger,
+                SanitizerError::DangerousDomain(host.to_owned()),
+            )
         {
             self.logger.error(e);
             return;

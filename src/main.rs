@@ -4,7 +4,7 @@ local HTML/asset files, a directory tree, or a list of URLs to fetch
 */
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use std::fs::{self};
 use web_sanitizer_sysprog::engine_structs::InputSource;
 use web_sanitizer_sysprog::log::logging_thread;
@@ -15,15 +15,26 @@ use std::sync::Arc;
 use url::Url;
 use walkdir::WalkDir;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    println!("Successfully parsed args: {:?}", args);
+
+    if args.generate_policy {
+        let string = toml::to_string_pretty(&Policy::default())
+            .context("Failed to serialize default policy")?;
+        println!("{string}");
+        return Ok(());
+    };
+
     println!("======= WELCOME TO THE WEB SANITIZER CLI INTERFACE =======");
 
     //run cli application
-    if let Err(e) = run() {
+    if let Err(e) = run(args) {
         eprintln!("Application error: {:?}", e);
     }
 
     println!("======================== GOODBYE =========================");
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -121,17 +132,7 @@ fn parse_inputs(inputs: Vec<String>) -> Result<Vec<InputSource>> {
 ///
 /// # Returns
 /// * `Result<()>` - `Ok(())` on successful completion, or an error if initialization fails.
-pub fn run() -> Result<()> {
-    let args = Args::parse();
-    println!("Successfully parsed args: {:?}", args);
-
-    if args.generate_policy {
-        let string = toml::to_string_pretty(&Policy::default())
-            .context("Failed to serialize default policy")?;
-        println!("huh {string}");
-        return Ok(());
-    };
-
+pub fn run(args: Args) -> Result<()> {
     let policy = load_policy(args.policy.as_ref())?;
     let sources = parse_inputs(args.inputs)?;
 

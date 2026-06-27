@@ -6,7 +6,7 @@ use std::io::Write;
 use url::Url;
 
 use crate::{
-    errors::{DangerousDomainInHtml, LoggerError},
+    errors::{LoggerError, SanitizerError},
     log::Logger,
     policy::Policy,
     url::RuleMatch,
@@ -31,10 +31,7 @@ fn handle_dangerous_link(
     logger: &Logger,
 ) -> Result<(), LoggerError> {
     if let Some(val) = el.get_attribute(attr_name) {
-        let resolved = {
-            let current_base = base_url;
-            current_base.join(&val)
-        };
+        let resolved = base_url.join(&val);
         if let Ok(mut resolved_url) = resolved
             && let Some(host) = resolved_url.host()
         {
@@ -60,7 +57,7 @@ fn handle_dangerous_link(
                         el.set_attribute(attr_name, new)?;
                         Ok(())
                     },
-                    DangerousDomainInHtml(host.to_owned(), location.bytes().start),
+                    SanitizerError::DangerousDomainInHtml(host.to_owned(), location.bytes().start),
                 )?;
             }
         }
@@ -147,7 +144,7 @@ pub fn create_rewriter<'a, W: Write>(
                                         let _ = policy.html.dangerous_domain.handle(
                                             logger,
                                             |x| el.set_attribute(attr_name, x),
-                                            DangerousDomainInHtml(
+                                            SanitizerError::DangerousDomainInHtml(
                                                 host_owned,
                                                 location.bytes().start,
                                             ),
@@ -161,7 +158,7 @@ pub fn create_rewriter<'a, W: Write>(
                                     "script" => "js",
                                     _ => "png",
                                 };
-                                let local_name = crate::resource_sanitizer::generate_local_filename(
+                                let local_name = crate::resources::generate_local_filename(
                                     &resolved_url,
                                     default_ext,
                                 );
@@ -194,7 +191,10 @@ pub fn create_rewriter<'a, W: Write>(
                     let _ = policy.html.dangerous_domain.handle(
                         logger,
                         |x| el.set_attribute("href", x),
-                        DangerousDomainInHtml(host.to_owned(), location.bytes().start),
+                        SanitizerError::DangerousDomainInHtml(
+                            host.to_owned(),
+                            location.bytes().start,
+                        ),
                     )?;
                 }
             }
