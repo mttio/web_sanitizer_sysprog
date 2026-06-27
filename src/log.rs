@@ -40,6 +40,7 @@ pub trait LoggerTrait {
     }
 }
 
+#[derive(Clone)]
 pub struct Logger {
     pub index: usize,
     pub channel: Sender<LoggerMessage>,

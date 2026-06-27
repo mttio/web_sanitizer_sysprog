@@ -35,6 +35,12 @@ pub enum SanitizerError {
     #[error("IDN url ({})", .0)]
     Idn(String),
     #[error(
+        "blocked script (source = {}) @ {}",
+        .0.bright_cyan(),
+        .1.to_string().bright_magenta(),
+    )]
+    BlockedScript(String, usize),
+    #[error(
         "response body exceeds maximum size ({} bytes)",
         .0.to_string().bright_cyan(),        
     )]

@@ -1,5 +1,6 @@
 use lol_html::{
     element,
+    text,
     send::{HtmlRewriter, Settings},
 };
 use std::io::Write;
@@ -7,7 +8,7 @@ use url::Url;
 
 use crate::{
     errors::{LoggerError, SanitizerError},
-    log::Logger,
+    log::{Logger, LoggerTrait},
     policy::Policy,
     url::RuleMatch,
 };
@@ -92,6 +93,29 @@ pub fn create_rewriter<'a, W: Write>(
     state: &'a mut CrawlerState,
     mut output: W,
 ) -> HtmlRewriter<'a, impl FnMut(&[u8])> {
+    use std::sync::Arc;
+    use parking_lot::Mutex;
+
+    let inline_script_location = Arc::new(Mutex::new(None));
+    let inline_script_location_el_1 = inline_script_location.clone();
+    let inline_script_location_el_2 = inline_script_location.clone();
+    let inline_script_location_text_1 = inline_script_location.clone();
+    let inline_script_location_text_2 = inline_script_location.clone();
+
+    let inline_script_buffer = Arc::new(Mutex::new(String::new()));
+    let inline_script_buffer_text_1 = inline_script_buffer.clone();
+    let inline_script_buffer_text_2 = inline_script_buffer.clone();
+
+    let policy_allow_scripts_el_1 = policy.html.allow_scripts.clone();
+    let policy_allow_scripts_el_2 = policy.html.allow_scripts.clone();
+    let policy_allow_scripts_text_1 = policy.html.allow_scripts.clone();
+    let policy_allow_scripts_text_2 = policy.html.allow_scripts.clone();
+
+    let logger_clone_el_1 = logger.clone();
+    let logger_clone_el_2 = logger.clone();
+    let logger_clone_text_1 = logger.clone();
+    let logger_clone_text_2 = logger.clone();
+
     let element_content_handlers = if policy.resources.fetch_sub_resources {
         vec![
             element!("*", move |el| {
@@ -121,7 +145,7 @@ pub fn create_rewriter<'a, W: Write>(
                 Ok(())
             }),
             element!(
-            "base[href], a[href], link[href], script[src], img[src], image[href], source[src]",
+            "base[href], a[href], link[href], script, img[src], image[href], source[src]",
             move |el| {
                 match el.tag_name().as_str() {
                     "base" => {
@@ -133,6 +157,39 @@ pub fn create_rewriter<'a, W: Write>(
                         Ok(())
                     }
                     "a" => handle_dangerous_link(el, "href", &state.base, policy, logger),
+                    "script" => {
+                        let location = el.source_location();
+                        if let Some(src) = el.get_attribute("src") {
+                            if let Ok(resolved_url) = state.base.join(&src) {
+                                let host_matched = if let Some(host) = resolved_url.host() {
+                                    let host_str = host.to_string();
+                                    policy_allow_scripts_el_1.iter().any(|allowed| {
+                                        allowed == &host_str || resolved_url.as_str().starts_with(allowed)
+                                    })
+                                } else {
+                                    false
+                                };
+
+                                if !host_matched {
+                                    logger_clone_el_1.error(SanitizerError::BlockedScript(src.clone(), location.bytes().start));
+                                    el.remove();
+                                    return Ok(());
+                                }
+
+                                if policy.resources.fetch_sub_resources {
+                                    let local_name = crate::resources::generate_local_filename(&resolved_url, "js");
+                                    el.set_attribute("src", &local_name).map_err(|e| Box::new(e) as LoggerError)?;
+                                    state.subresources.push((resolved_url, local_name));
+                                }
+                            } else {
+                                logger_clone_el_1.error(SanitizerError::BlockedScript(src.clone(), location.bytes().start));
+                                el.remove();
+                            }
+                        } else {
+                            *inline_script_location_el_1.lock() = Some(location.bytes().start);
+                        }
+                        Ok(())
+                    }
                     tag_name => {
                         let tag_name = tag_name.to_lowercase();
                         let attr_name = if tag_name == "link" || tag_name == "image" {
@@ -198,8 +255,37 @@ pub fn create_rewriter<'a, W: Write>(
                     }
                 }
             }
-        )]
+            ),
+            text!("script", move |t| {
+                use sha2::{Sha256, Digest};
+                use base64::{prelude::BASE64_STANDARD, Engine};
+
+                let mut accum = inline_script_buffer_text_1.lock();
+                accum.push_str(t.as_str());
+                t.remove();
+
+                if t.last_in_text_node() {
+                    let mut hasher = Sha256::new();
+                    hasher.update(accum.as_bytes());
+                    let hash_result = hasher.finalize();
+                    let b64_hash = BASE64_STANDARD.encode(hash_result);
+                    let csp_hash = format!("sha256-{}", b64_hash);
+
+                    let is_allowed = policy_allow_scripts_text_1.iter().any(|allowed| allowed == &csp_hash);
+                    if is_allowed {
+                        t.replace(&accum, lol_html::html_content::ContentType::Text);
+                    } else {
+                        let offset = inline_script_location_text_1.lock().unwrap_or(0);
+                        logger_clone_text_1.error(SanitizerError::BlockedScript("<inline>".to_owned(), offset));
+                    }
+                    accum.clear();
+                    *inline_script_location_text_1.lock() = None;
+                }
+                Ok(())
+            })
+        ]
     } else {
+        let base_url = state.base.clone();
         vec![
             element!("*", move |el| {
                 if !policy.html.event_handlers.is_ignore() {
@@ -227,9 +313,36 @@ pub fn create_rewriter<'a, W: Write>(
                 }
                 Ok(())
             }),
-            element!("a[href], link[href]", move |el| {
-            let href = el.get_attribute("href").expect("href was required");
-            if let Ok(href) = Url::parse(&href)
+            element!("a[href], link[href], script", move |el| {
+                if el.tag_name() == "script" {
+                    let location = el.source_location();
+                    if let Some(src) = el.get_attribute("src") {
+                        if let Ok(resolved_url) = base_url.join(&src) {
+                            let host_matched = if let Some(host) = resolved_url.host() {
+                                let host_str = host.to_string();
+                                policy_allow_scripts_el_2.iter().any(|allowed| {
+                                    allowed == &host_str || resolved_url.as_str().starts_with(allowed)
+                                })
+                            } else {
+                                false
+                            };
+
+                            if !host_matched {
+                                logger_clone_el_2.error(SanitizerError::BlockedScript(src.clone(), location.bytes().start));
+                                el.remove();
+                                return Ok(());
+                            }
+                        } else {
+                            logger_clone_el_2.error(SanitizerError::BlockedScript(src.clone(), location.bytes().start));
+                            el.remove();
+                        }
+                    } else {
+                        *inline_script_location_el_2.lock() = Some(location.bytes().start);
+                    }
+                    return Ok(());
+                }
+                let href = el.get_attribute("href").expect("href was required");
+                if let Ok(href) = Url::parse(&href)
                 && let Some(host) = href.host()
             {
                 let host = host.to_owned();
@@ -254,7 +367,35 @@ pub fn create_rewriter<'a, W: Write>(
             }
 
             Ok(())
-        })]
+        }),
+            text!("script", move |t| {
+                use sha2::{Sha256, Digest};
+                use base64::{prelude::BASE64_STANDARD, Engine};
+
+                let mut accum = inline_script_buffer_text_2.lock();
+                accum.push_str(t.as_str());
+                t.remove();
+
+                if t.last_in_text_node() {
+                    let mut hasher = Sha256::new();
+                    hasher.update(accum.as_bytes());
+                    let hash_result = hasher.finalize();
+                    let b64_hash = BASE64_STANDARD.encode(hash_result);
+                    let csp_hash = format!("sha256-{}", b64_hash);
+
+                    let is_allowed = policy_allow_scripts_text_2.iter().any(|allowed| allowed == &csp_hash);
+                    if is_allowed {
+                        t.replace(&accum, lol_html::html_content::ContentType::Text);
+                    } else {
+                        let offset = inline_script_location_text_2.lock().unwrap_or(0);
+                        logger_clone_text_2.error(SanitizerError::BlockedScript("<inline>".to_owned(), offset));
+                    }
+                    accum.clear();
+                    *inline_script_location_text_2.lock() = None;
+                }
+                Ok(())
+            })
+        ]
     };
 
     HtmlRewriter::new(
@@ -340,5 +481,93 @@ mod tests {
 
         let result = String::from_utf8(output).unwrap();
         assert!(result.contains("onclick=\"alert(1)\""));
+    }
+
+    #[test]
+    fn test_script_src_allowed() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.allow_scripts = vec!["trusted.com".to_owned()];
+
+        let input_html = b"<script src=\"https://trusted.com/lib.js\"></script>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("<script src=\"sub_"));
+    }
+
+    #[test]
+    fn test_script_src_blocked() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.allow_scripts = vec!["trusted.com".to_owned()];
+
+        let input_html = b"<script src=\"https://untrusted.com/lib.js\"></script>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(!result.contains("untrusted.com"));
+        assert!(!result.contains("<script"));
+    }
+
+    #[test]
+    fn test_script_inline_allowed() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.allow_scripts = vec!["sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI=".to_owned()];
+
+        let input_html = b"<script>alert(1)</script>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("alert(1)"));
+    }
+
+    #[test]
+    fn test_script_inline_blocked() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let policy = Policy::default();
+
+        let input_html = b"<script>alert(1)</script>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(!result.contains("alert(1)"));
     }
 }
