@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /_/    \___/_/ /_/\___/_/\____/ .___/\___/    
                              /_/              
 "#.cyan().bold());
-    println!("{}", "✨ Welcome to the Penelope Web Sanitizer CLI Interface ✨".bright_blue().bold());
+    println!("{}", "[+] Welcome to the Penelope Web Sanitizer CLI Interface".bright_blue().bold());
     println!("{}", "==========================================================".bright_blue());
 
     //run cli application
@@ -146,25 +146,25 @@ pub fn run(args: Args) -> Result<()> {
     let policy = load_policy(args.policy.as_ref())?;
     
     // Print argument summary
-    println!("\n{}", "⚙️  ACTIVE CONFIGURATION SUMMARY:".bright_blue().bold());
-    println!("  📂 {} {:?}", "Inputs:".bright_blue(), args.inputs);
-    println!("  ⚙️   {} {}", "Policy:".bright_blue(), match &args.policy {
+    println!("\n{}", "[SYSTEM] ACTIVE CONFIGURATION SUMMARY:".bright_blue().bold());
+    println!("  [Inputs]:     {:?}", args.inputs);
+    println!("  [Policy]:     {}", match &args.policy {
         Some(p) => format!("{:?}", p),
         None => "Default Embedded Policy".to_owned()
     });
-    println!("  📦 {} {:?}", "Output Dir:".bright_blue(), args.output_dir);
-    println!("  🧵 {} {}", "Workers:".bright_blue(), args.workers.to_string().yellow());
+    println!("  [Output Dir]: {:?}", args.output_dir);
+    println!("  [Workers]:    {}", args.workers.to_string().yellow());
     println!("");
 
     let sources = parse_inputs(args.inputs)?;
 
     if sources.is_empty() {
-        println!("{}", "⚠️  No valid inputs provided.".yellow());
+        println!("{}", "[!] No valid inputs provided.".yellow());
         return Ok(());
     }
 
     // Step 1: Clean output directory
-    println!("{}", "[1/3] 🧹 Cleaning output folder...".bright_black().bold());
+    println!("{}", "[1/3] Cleaning output folder...".bright_black().bold());
     if args.output_dir.exists() {
         fs::remove_dir_all(&args.output_dir)
             .with_context(|| format!("Failed to empty output directory: {:?}", args.output_dir))?;
@@ -173,7 +173,7 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("Failed to create output directory: {:?}", args.output_dir))?;
 
     // Step 2: Initialize parallel pipeline
-    println!("{}", "[2/3] 🚀 Initializing parallel sanitization pipeline...".bright_black().bold());
+    println!("{}", "[2/3] Initializing parallel sanitization pipeline...".bright_black().bold());
     let (tx, rx) = std::sync::mpsc::channel();
 
     let policy = Arc::new(policy);
@@ -187,7 +187,7 @@ pub fn run(args: Args) -> Result<()> {
     let max_size = sources.len();
 
     // Step 3: Run and log
-    println!("{}", "[3/3] 📊 Processing inputs & streaming logs...".bright_black().bold());
+    println!("{}", "[3/3] Processing inputs & streaming logs...".bright_black().bold());
     let library_result = web_sanitizer_sysprog::library(
         &runtime,
         sources,
@@ -199,10 +199,10 @@ pub fn run(args: Args) -> Result<()> {
     match library_result {
         Ok(_) => {
             logging_thread(&output_dir, &policy, max_size, rx);
-            println!("\n{}", "✨ Execution complete! Checked files have been processed.".bright_blue().bold());
+            println!("\n{}", "[+] Execution complete! Checked files have been processed.".bright_blue().bold());
         }
         Err(e) => {
-            println!("\n{}", "❌ Sanitization failed with error:".red().bold());
+            println!("\n{}", "[-] Sanitization failed with error:".red().bold());
             return Err(e);
         }
     }
