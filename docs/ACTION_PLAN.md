@@ -8,11 +8,11 @@
 *Focuses heavily on the HTML rewriting engine, structural parsing, text manipulation, and compiling the final security reports.*
 
 ### 1. HTML Structural Sanitisation (`sanitizer_engine/html.rs`)
-- [ ] **Strip/Filter Inline Event Handlers**: Strip event attributes (e.g., `onclick`, `onerror`, `onload`, `onmouseover`) from all HTML tags when `strip_event_handlers` is enabled.
-- [ ] **Validate `<script>` Blocks**:
+- [x] **Strip/Filter Inline Event Handlers**: Strip event attributes (e.g., `onclick`, `onerror`, `onload`, `onmouseover`) from all HTML tags when `strip_event_handlers` is enabled.
+- [x] **Validate `<script>` Blocks**:
   - Compare script sources and inline content hashes against the policy `allow_scripts` allow-list.
   - Strip or neutralize any scripts that do not match the allow-list.
-- [ ] **Sanitize dangerous URIs**: Block or remove `javascript:` and `data:` URIs in element attributes (like `href` or `src`).
+- [x] **Sanitize dangerous URIs**: Block or remove `javascript:` and `data:` URIs in element attributes (like `href` or `src`).
 - [ ] **Restrict `<iframe>` and `<object>` Origins**:
   - Parse target origins and validate them against the `allow_origins` policy.
   - Strip or rewrite elements pointing to untrusted hosts.

@@ -24,6 +24,10 @@ impl<R: Default> RuleWithReplace<R> {
         Self { replace, level }
     }
 
+    pub fn is_ignore(&self) -> bool {
+        self.level.is_ignore()
+    }
+
     pub fn handle<T, F: FnOnce(&R) -> T, M: Into<SanitizerError>>(
         &self,
         logger: &impl LoggerTrait,

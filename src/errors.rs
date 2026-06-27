@@ -32,8 +32,23 @@ pub enum SanitizerError {
         }        
     )]
     EventHandler(String, Option<usize>),
+    #[error(
+        "dangerous URI ({}){}",
+        .0.bright_cyan(),
+        match .1 {
+            Some(x) => format!(" @ {}", x.to_string().bright_magenta()),
+            None => "".to_owned(),
+        }
+    )]
+    DangerousUri(String, Option<usize>),
     #[error("IDN url ({})", .0)]
     Idn(String),
+    #[error(
+        "blocked script (source = {}) @ {}",
+        .0.bright_cyan(),
+        .1.to_string().bright_magenta(),
+    )]
+    BlockedScript(String, usize),
     #[error(
         "response body exceeds maximum size ({} bytes)",
         .0.to_string().bright_cyan(),        
