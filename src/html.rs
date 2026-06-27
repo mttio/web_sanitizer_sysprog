@@ -93,7 +93,34 @@ pub fn create_rewriter<'a, W: Write>(
     mut output: W,
 ) -> HtmlRewriter<'a, impl FnMut(&[u8])> {
     let element_content_handlers = if policy.resources.fetch_sub_resources {
-        vec![element!(
+        vec![
+            element!("*", move |el| {
+                if policy.html.strip_event_handlers {
+                    let event_attrs: Vec<String> = el.attributes()
+                        .iter()
+                        .map(|attr| attr.name())
+                        .filter(|name| name.to_lowercase().starts_with("on"))
+                        .collect();
+
+                    for attr_name in event_attrs {
+                        let location = el.source_location();
+                        policy.html.event_handlers.handle(
+                            logger,
+                            |replacement| -> Result<(), LoggerError> {
+                                if replacement.is_empty() {
+                                    el.remove_attribute(&attr_name);
+                                } else {
+                                    el.set_attribute(&attr_name, replacement).map_err(|e| Box::new(e) as LoggerError)?;
+                                }
+                                Ok(())
+                            },
+                            SanitizerError::EventHandler(attr_name.clone(), Some(location.bytes().start)),
+                        )??;
+                    }
+                }
+                Ok(())
+            }),
+            element!(
             "base[href], a[href], link[href], script[src], img[src], image[href], source[src]",
             move |el| {
                 match el.tag_name().as_str() {
@@ -173,7 +200,34 @@ pub fn create_rewriter<'a, W: Write>(
             }
         )]
     } else {
-        vec![element!("a[href], link[href]", move |el| {
+        vec![
+            element!("*", move |el| {
+                if policy.html.strip_event_handlers {
+                    let event_attrs: Vec<String> = el.attributes()
+                        .iter()
+                        .map(|attr| attr.name())
+                        .filter(|name| name.to_lowercase().starts_with("on"))
+                        .collect();
+
+                    for attr_name in event_attrs {
+                        let location = el.source_location();
+                        policy.html.event_handlers.handle(
+                            logger,
+                            |replacement| -> Result<(), LoggerError> {
+                                if replacement.is_empty() {
+                                    el.remove_attribute(&attr_name);
+                                } else {
+                                    el.set_attribute(&attr_name, replacement).map_err(|e| Box::new(e) as LoggerError)?;
+                                }
+                                Ok(())
+                            },
+                            SanitizerError::EventHandler(attr_name.clone(), Some(location.bytes().start)),
+                        )??;
+                    }
+                }
+                Ok(())
+            }),
+            element!("a[href], link[href]", move |el| {
             let href = el.get_attribute("href").expect("href was required");
             if let Ok(href) = Url::parse(&href)
                 && let Some(host) = href.host()
@@ -212,4 +266,59 @@ pub fn create_rewriter<'a, W: Write>(
             output.write_all(c).unwrap();
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::Logger;
+    use std::sync::mpsc;
+
+    #[test]
+    fn test_event_handler_stripping() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.strip_event_handlers = true;
+
+        let input_html = b"<button onclick=\"alert(1)\" class=\"btn\" ONLOAD=\"doSomething()\">Click me</button>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(!result.contains("onclick"));
+        assert!(!result.contains("ONLOAD"));
+        assert!(result.contains("class=\"btn\""));
+        assert!(result.contains("Click me"));
+    }
+
+    #[test]
+    fn test_event_handler_replacement() {
+        let (tx, _rx) = mpsc::channel();
+        let logger = Logger { index: 0, channel: tx };
+        let mut policy = Policy::default();
+        policy.html.strip_event_handlers = true;
+        policy.html.event_handlers = crate::rules::RuleWithReplace::new("alert('blocked')".to_owned(), crate::log::LogLevel::Info);
+
+        let input_html = b"<button onclick=\"alert(1)\"></button>";
+        let mut output = Vec::new();
+        let mut state = CrawlerState {
+            base: Url::parse("https://localhost").unwrap(),
+            subresources: Vec::new(),
+        };
+
+        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        rewriter.write(input_html).unwrap();
+        rewriter.end().unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("onclick=\"alert('blocked')\""));
+    }
 }

@@ -64,6 +64,7 @@ pub struct Policy {
 pub struct HtmlPolicy {
     pub allow_scripts: Vec<String>,
     pub allow_origins: Vec<PolicyHost>,
+    pub strip_event_handlers: bool,
     /// Action to perform when an event handler is encountered
     pub event_handlers: RuleWithReplace<String>,
     /// Action to perform when a dangerous domain is encountered
@@ -79,6 +80,7 @@ impl Default for HtmlPolicy {
                 .flat_map(Host::parse)
                 .map(PolicyHost)
                 .collect(),
+            strip_event_handlers: true,
             event_handlers: RuleWithReplace::new("".to_owned(), LogLevel::Info),
             dangerous_domain: RuleWithReplace::new("#".to_owned(), LogLevel::Error),
         }

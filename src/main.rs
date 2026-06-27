@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Input files, directories or URLs
+    #[arg(required_unless_present = "generate_policy")]
     pub inputs: Vec<String>,
 
     /// Policy configuration file (JSON)
