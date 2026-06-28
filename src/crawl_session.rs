@@ -324,11 +324,11 @@ impl CrawlSession {
     /// Worker task fetching a remote HTML document, sanitizing it, and enqueuing referenced sub-resources.
     pub async fn process_url(self: Arc<Self>, url: Url) {
         if let Some(original) = check_domain(&url)
-            && let Err(e) = self
-                .policy
-                .urls
-                .idn
-                .handle(&self.logger, SanitizerError::Idn(original))
+            && let Err(e) =
+                self.policy
+                    .urls
+                    .idn
+                    .handle(&self.logger, |_| {}, SanitizerError::Idn(original))
         {
             self.logger.error(e);
             return;

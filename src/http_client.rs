@@ -190,7 +190,7 @@ impl SanitizerHttpClient {
                         policy
                             .urls
                             .idn
-                            .handle(&logger, SanitizerError::Idn(original))?;
+                            .handle(&logger, |_| {}, SanitizerError::Idn(original))?;
                     }
 
                     let max_redirects = policy.connections.max_redirects;

@@ -1,4 +1,4 @@
-use std::{fmt::Display, path::PathBuf};
+use std::{fmt::Display, ops::Range, path::PathBuf};
 
 use colored::Colorize;
 use hickory_resolver::net::NetError;
@@ -47,11 +47,12 @@ pub enum SanitizerError {
     #[error("IDN url ({})", .0)]
     Idn(String),
     #[error(
-        "blocked script (source = {}) @ {}",
+        "blocked script (source = {}) @ {}..{}",
         .0.bright_cyan(),
-        .1.to_string().bright_magenta(),
+        .1.start.to_string().bright_magenta(),
+        .1.end.to_string().bright_magenta(),
     )]
-    BlockedScript(String, usize),
+    BlockedScript(String, Range<usize>),
     #[error(
         "response body exceeds maximum size ({} bytes)",
         .0.to_string().bright_cyan(),        

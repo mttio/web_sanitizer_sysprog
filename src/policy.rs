@@ -148,7 +148,7 @@ pub struct UrlsPolicy {
     /// Ignores prefix labels (e.g. `youtube.com` matches `www.youtube.com`)
     pub dangerous_domains: Vec<PolicyHost>,
     /// Action to perform when a non-latin url is encountered
-    pub idn: LogLevel,
+    pub idn: RuleWithReplace<AttributeUrl>,
 }
 
 impl Default for UrlsPolicy {
@@ -159,7 +159,7 @@ impl Default for UrlsPolicy {
                 .flat_map(Host::parse)
                 .map(PolicyHost)
                 .collect(),
-            idn: LogLevel::Warn,
+            idn: RuleWithReplace::with_default(LogLevel::Warn),
         }
     }
 }
