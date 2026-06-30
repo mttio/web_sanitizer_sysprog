@@ -24,26 +24,31 @@ pub enum SanitizerError {
     ServerStatus(reqwest::StatusCode),
     #[error("dangerous domain ({})", .0.to_string().bright_cyan())]
     DangerousDomain(Host),
-    #[error("dangerous domain ({}) @ {}", .0.to_string().bright_cyan(), .1.to_string().bright_magenta())]
-    DangerousDomainInHtml(Host, usize),
+    #[error(
+        "dangerous domain ({}) @ {}..{}",
+        .0.to_string().bright_cyan(),
+        .1.start.to_string().bright_magenta(),
+        .1.end.to_string().bright_magenta(),
+    )]
+    DangerousDomainInHtml(Host, Range<usize>),
     #[error(
         "event handler ({}){}",
         .0.bright_cyan(),
         match .1 {
-            Some(x) => format!(" @ {}", x.to_string().bright_magenta()),
+            Some(x) => format!(" @ {}..{}", x.start.to_string().bright_magenta(), x.end.to_string().bright_magenta()),
             None => "".to_owned(),
         }        
     )]
-    EventHandler(String, Option<usize>),
+    EventHandler(String, Option<Range<usize>>),
     #[error(
         "dangerous URI ({}){}",
         .0.bright_cyan(),
         match .1 {
-            Some(x) => format!(" @ {}", x.to_string().bright_magenta()),
+            Some(x) => format!(" @ {}..{}", x.start.to_string().bright_magenta(), x.end.to_string().bright_magenta()),
             None => "".to_owned(),
         }
     )]
-    DangerousUri(String, Option<usize>),
+    DangerousUri(String, Option<Range<usize>>),
     #[error("IDN url ({})", .0)]
     Idn(String),
     #[error(

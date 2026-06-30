@@ -31,15 +31,20 @@ fn handle_dangerous_link(
     policy: &Policy,
     logger: &Logger,
 ) -> Result<Option<Url>, SanitizerError> {
-    if let Some(val) = el.get_attribute(attr_name) {
-        use unicode_normalization::UnicodeNormalization;
-        let val_normalized = val.nfc().collect::<String>();
+    use unicode_normalization::UnicodeNormalization;
 
-        let resolved = base_url.join(&val_normalized);
+    if let Some(attribute) = el.attributes().iter().find(|x| x.name() == attr_name) {
+        let val = attribute.value().nfc().collect::<String>();
+
+        let resolved = base_url.join(&val);
         if let Ok(mut resolved) = resolved
         // && resolved.scheme() == "https"
         {
             if let Some(host) = resolved.host() {
+                let location = attribute
+                    .value_source_location()
+                    .unwrap_or(el.source_location());
+
                 // Check IDN
                 if let Some(original) = crate::url::check_domain(&resolved) {
                     policy.urls.idn.handle(
@@ -58,8 +63,6 @@ fn handle_dangerous_link(
                     .any(|x| x.0.matches(&host));
 
                 if is_dangerous {
-                    let location = el.source_location();
-
                     policy.html.dangerous_domain.handle(
                         logger,
                         |x| {
@@ -72,7 +75,7 @@ fn handle_dangerous_link(
 
                             new.replace_attribute(attr_name, el);
                         },
-                        SanitizerError::DangerousDomainInHtml(host, location.bytes().start),
+                        SanitizerError::DangerousDomainInHtml(host, location.bytes()),
                     )?;
                 }
             }
@@ -117,152 +120,147 @@ pub fn create_rewriter<'a, W: Write>(
         let event_attrs: Vec<_> = el
             .attributes()
             .iter()
-            .map(|attr| attr.name())
-            .filter(|name| name.to_lowercase().starts_with("on"))
+            .filter(|x| x.name().to_lowercase().starts_with("on"))
+            .map(|x| (x.name(), x.value_source_location()))
             .collect();
 
-        for attr_name in event_attrs {
-            let location = el.source_location();
+        for (name, location) in event_attrs {
+            let location = location.unwrap_or(el.source_location()).bytes();
             policy.html.event_handlers.handle(
                 logger,
-                |x| x.replace_attribute(&attr_name, el),
-                SanitizerError::EventHandler(attr_name.clone(), Some(location.bytes().start)),
+                |x| x.replace_attribute(&name, el),
+                SanitizerError::EventHandler(name.clone(), Some(location)),
             )?;
         }
 
         let dangerous_uri_attrs: Vec<_> = el
             .attributes()
             .iter()
-            .map(|attr| (attr.name(), attr.value().trim().to_lowercase()))
-            .filter(|(_, x)| x.starts_with("javascript:") || x.starts_with("data:"))
+            .filter(|x| {
+                let value = x.value().trim().to_lowercase();
+                value.starts_with("javascript:") || value.starts_with("data:")
+            })
+            .map(|x| (x.name(), x.value(), x.value_source_location()))
             .collect();
 
-        for (attr_name, val) in dangerous_uri_attrs {
-            let location = el.source_location();
+        for (name, value, location) in dangerous_uri_attrs {
+            let location = location.unwrap_or(el.source_location()).bytes();
             policy.html.dangerous_uris.handle(
                 logger,
-                |x| x.replace_attribute(&attr_name, el),
-                SanitizerError::DangerousUri(val, Some(location.bytes().start)),
+                |x| x.replace_attribute(&name, el),
+                SanitizerError::DangerousUri(value, Some(location)),
             )?;
         }
 
-        Ok(())
-    }));
-
-    handlers.push(element!(
-        "base[href], a[href], link[href], img[src], image[href], source[src], script",
-        move |el| {
-            match el.tag_name().as_str() {
-                "base" => {
-                    if let Some(href) = el.get_attribute("href")
-                        && let Ok(new_base) = state.base.join(&href)
-                    {
-                        state.base = new_base;
-                    }
+        match el.tag_name().as_str() {
+            "base" => {
+                if let Some(href) = el.get_attribute("href")
+                    && let Ok(new_base) = state.base.join(&href)
+                {
+                    state.base = new_base;
                 }
-                "a" => {
+            }
+            "a" => {
+                handle_dangerous_link(el, "href", &state.base, policy, logger)?;
+            }
+            "link" => {
+                let rel = el.get_attribute("rel").unwrap_or_default().to_lowercase();
+                if !rel.contains("stylesheet") {
                     handle_dangerous_link(el, "href", &state.base, policy, logger)?;
+                    return Ok(());
                 }
-                "link" => {
-                    let rel = el.get_attribute("rel").unwrap_or_default().to_lowercase();
-                    if !rel.contains("stylesheet") {
-                        handle_dangerous_link(el, "href", &state.base, policy, logger)?;
+
+                if let Some(resolved) =
+                    handle_dangerous_link(el, "href", &state.base, policy, logger)?
+                    && policy.resources.fetch_sub_resources
+                {
+                    let local_name = crate::resources::generate_local_filename(&resolved, "css");
+
+                    el.set_attribute("href", &local_name)?;
+                    state.subresources.push((resolved, local_name));
+                }
+            }
+            "img" => {
+                if let Some(resolved) =
+                    handle_dangerous_link(el, "src", &state.base, policy, logger)?
+                    && policy.resources.fetch_sub_resources
+                {
+                    let local_name = crate::resources::generate_local_filename(&resolved, "png");
+
+                    el.set_attribute("src", &local_name)?;
+                    state.subresources.push((resolved, local_name));
+                }
+            }
+            "image" => {
+                if let Some(resolved) =
+                    handle_dangerous_link(el, "href", &state.base, policy, logger)?
+                    && policy.resources.fetch_sub_resources
+                {
+                    let local_name = crate::resources::generate_local_filename(&resolved, "png");
+
+                    el.set_attribute("href", &local_name)?;
+                    state.subresources.push((resolved, local_name));
+                }
+            }
+            "source" => {
+                if let Some(resolved) =
+                    handle_dangerous_link(el, "src", &state.base, policy, logger)?
+                    && policy.resources.fetch_sub_resources
+                {
+                    let local_name = crate::resources::generate_local_filename(&resolved, "js");
+
+                    el.set_attribute("src", &local_name)?;
+                    state.subresources.push((resolved, local_name));
+                }
+            }
+            "script" => {
+                let location = el.source_location();
+
+                if let Some(resolved) =
+                    handle_dangerous_link(el, "src", &state.base, policy, logger)?
+                {
+                    let host_matched = if let Some(host) = resolved.host() {
+                        let host = host.to_string();
+                        policy.html.allow_scripts.iter().any(|allowed| {
+                            allowed == &host || resolved.as_str().starts_with(allowed)
+                        })
+                    } else {
+                        false
+                    };
+
+                    if !host_matched {
+                        logger.error(SanitizerError::BlockedScript(
+                            resolved.to_string(),
+                            location.bytes(),
+                        ));
+                        el.remove();
                         return Ok(());
                     }
 
-                    if let Some(resolved) =
-                        handle_dangerous_link(el, "href", &state.base, policy, logger)?
-                        && policy.resources.fetch_sub_resources
-                    {
-                        let local_name =
-                            crate::resources::generate_local_filename(&resolved, "css");
-
-                        el.set_attribute("href", &local_name)?;
-                        state.subresources.push((resolved, local_name));
-                    }
-                }
-                "img" => {
-                    if let Some(resolved) =
-                        handle_dangerous_link(el, "src", &state.base, policy, logger)?
-                        && policy.resources.fetch_sub_resources
-                    {
-                        let local_name =
-                            crate::resources::generate_local_filename(&resolved, "png");
-
-                        el.set_attribute("src", &local_name)?;
-                        state.subresources.push((resolved, local_name));
-                    }
-                }
-                "image" => {
-                    if let Some(resolved) =
-                        handle_dangerous_link(el, "href", &state.base, policy, logger)?
-                        && policy.resources.fetch_sub_resources
-                    {
-                        let local_name =
-                            crate::resources::generate_local_filename(&resolved, "png");
-
-                        el.set_attribute("href", &local_name)?;
-                        state.subresources.push((resolved, local_name));
-                    }
-                }
-                "source" => {
-                    if let Some(resolved) =
-                        handle_dangerous_link(el, "src", &state.base, policy, logger)?
-                        && policy.resources.fetch_sub_resources
-                    {
+                    if policy.resources.fetch_sub_resources {
                         let local_name = crate::resources::generate_local_filename(&resolved, "js");
 
                         el.set_attribute("src", &local_name)?;
                         state.subresources.push((resolved, local_name));
                     }
-                }
-                "script" => {
-                    let location = el.source_location();
-
-                    if let Some(resolved) =
-                        handle_dangerous_link(el, "src", &state.base, policy, logger)?
-                    {
-                        let host_matched = if let Some(host) = resolved.host() {
-                            let host = host.to_string();
-                            policy.html.allow_scripts.iter().any(|allowed| {
-                                allowed == &host || resolved.as_str().starts_with(allowed)
-                            })
-                        } else {
-                            false
-                        };
-
-                        if !host_matched {
-                            logger.error(SanitizerError::BlockedScript(
-                                resolved.to_string(),
-                                location.bytes(),
-                            ));
-                            el.remove();
-                            return Ok(());
-                        }
-
-                        if policy.resources.fetch_sub_resources {
-                            let local_name =
-                                crate::resources::generate_local_filename(&resolved, "js");
-
-                            el.set_attribute("src", &local_name)?;
-                            state.subresources.push((resolved, local_name));
-                        }
-                    } else {
-                        if let Some(src) = el.get_attribute("src") {
-                            logger.error(SanitizerError::BlockedScript(
-                                src.clone(),
-                                location.bytes(),
-                            ));
-                            el.remove();
-                        }
+                } else {
+                    if let Some(src) = el.get_attribute("src") {
+                        logger.error(SanitizerError::BlockedScript(src.clone(), location.bytes()));
+                        el.remove();
                     }
                 }
-                _ => {}
             }
-
-            Ok(())
+            "iframe" => {
+                handle_dangerous_link(el, "src", &state.base, policy, logger)?;
+            }
+            "object" => {
+                handle_dangerous_link(el, "data", &state.base, policy, logger)?;
+            }
+            _ => {}
         }
-    ));
+
+        Ok(())
+    }));
 
     let mut inline_script = String::new();
     let mut inline_script_location = None;

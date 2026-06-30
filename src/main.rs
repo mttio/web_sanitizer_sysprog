@@ -90,7 +90,7 @@ pub struct Args {
     #[arg(required_unless_present = "generate_policy")]
     pub inputs: Vec<String>,
 
-    /// Policy configuration file (JSON)
+    /// Policy configuration file (.toml)
     #[arg(short, long)]
     pub policy: Option<PathBuf>,
 
