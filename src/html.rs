@@ -1,9 +1,11 @@
 use lol_html::{
     element,
+    html_content::ContentType,
     send::{HtmlRewriter, Settings},
     text,
 };
-use std::io::Write;
+use parking_lot::Mutex;
+use std::{io::Write, ops::Range, sync::Arc};
 use url::Url;
 
 use crate::{
@@ -12,6 +14,62 @@ use crate::{
     policy::{AttributeUrl, Policy},
     url::RuleMatch,
 };
+
+fn handle_dangerous_link_2(
+    value: &str,
+    location: Range<usize>,
+    base_url: &Url,
+    policy: &Policy,
+    logger: &Logger,
+    mut replace: impl FnMut(&AttributeUrl),
+) -> Result<Option<Url>, SanitizerError> {
+    use unicode_normalization::UnicodeNormalization;
+    let value = value.nfc().collect::<String>();
+
+    let resolved = base_url.join(&value);
+    if let Ok(mut resolved) = resolved
+    // && resolved.scheme() == "https"
+    {
+        if let Some(host) = resolved.host() {
+            // Check IDN
+            if let Some(original) = crate::url::check_domain(&resolved) {
+                policy
+                    .urls
+                    .idn
+                    .handle(logger, &mut replace, SanitizerError::Idn(original))?;
+            }
+
+            let host = host.to_owned();
+
+            let is_dangerous = policy
+                .urls
+                .dangerous_domains
+                .iter()
+                .any(|x| x.0.matches(&host));
+
+            if is_dangerous {
+                policy.html.dangerous_domain.handle(
+                    logger,
+                    |x| {
+                        let new = match resolved.set_host(Some(x.as_ref())) {
+                            // If policy value is a valid host, replace the host of the old url
+                            Ok(_) => &AttributeUrl::new(resolved.as_ref()),
+                            // Otherwise replace the whole url with the policy value
+                            Err(_) => x,
+                        };
+
+                        replace(new)
+                    },
+                    SanitizerError::DangerousDomainInHtml(host, location),
+                )?;
+            }
+        }
+
+        Ok(Some(resolved))
+    } else {
+        Ok(None)
+    }
+}
 
 /// Helper function to inspect an element's URL attribute for dangerous domains and rewrite it if necessary.
 ///
@@ -31,57 +89,20 @@ fn handle_dangerous_link(
     policy: &Policy,
     logger: &Logger,
 ) -> Result<Option<Url>, SanitizerError> {
-    use unicode_normalization::UnicodeNormalization;
-
     if let Some(attribute) = el.attributes().iter().find(|x| x.name() == attr_name) {
-        let val = attribute.value().nfc().collect::<String>();
+        let location = attribute
+            .value_source_location()
+            .unwrap_or(el.source_location())
+            .bytes();
 
-        let resolved = base_url.join(&val);
-        if let Ok(mut resolved) = resolved
-        // && resolved.scheme() == "https"
-        {
-            if let Some(host) = resolved.host() {
-                let location = attribute
-                    .value_source_location()
-                    .unwrap_or(el.source_location());
-
-                // Check IDN
-                if let Some(original) = crate::url::check_domain(&resolved) {
-                    policy.urls.idn.handle(
-                        logger,
-                        |x| x.replace_attribute(attr_name, el),
-                        SanitizerError::Idn(original),
-                    )?;
-                }
-
-                let host = host.to_owned();
-
-                let is_dangerous = policy
-                    .urls
-                    .dangerous_domains
-                    .iter()
-                    .any(|x| x.0.matches(&host));
-
-                if is_dangerous {
-                    policy.html.dangerous_domain.handle(
-                        logger,
-                        |x| {
-                            let new = match resolved.set_host(Some(x.as_ref())) {
-                                // If policy value is a valid host, replace the host of the old url
-                                Ok(_) => &AttributeUrl::new(resolved.as_ref()),
-                                // Otherwise replace the whole url with the policy value
-                                Err(_) => x,
-                            };
-
-                            new.replace_attribute(attr_name, el);
-                        },
-                        SanitizerError::DangerousDomainInHtml(host, location.bytes()),
-                    )?;
-                }
-            }
-
-            return Ok(Some(resolved));
-        }
+        handle_dangerous_link_2(
+            &attribute.value(),
+            location,
+            base_url,
+            policy,
+            logger,
+            |x| x.replace_attribute(attr_name, el),
+        )?;
     }
 
     Ok(None)
@@ -116,7 +137,13 @@ pub fn create_rewriter<'a, W: Write>(
 ) -> HtmlRewriter<'a, impl FnMut(&[u8])> {
     let mut handlers = Vec::new();
 
+    // Since the both the `element!` closure and the `text!` closures modify the state, we need to use an `Arc<Mutex>` here, even though the closures are executed sequentially
+    let state_1 = Arc::new(Mutex::new(state));
+    let state_2 = Arc::clone(&state_1);
+
     handlers.push(element!("*", move |el| {
+        let mut state = state_1.lock();
+
         let event_attrs: Vec<_> = el
             .attributes()
             .iter()
@@ -256,6 +283,26 @@ pub fn create_rewriter<'a, W: Write>(
             "object" => {
                 handle_dangerous_link(el, "data", &state.base, policy, logger)?;
             }
+            "meta" => {
+                if let Some(http_equiv) = el.get_attribute("http-equiv")
+                    && http_equiv.to_lowercase() == "refresh"
+                    && let Some(content) = el.get_attribute("content")
+                    && let Some((time, url)) = content.split_once(";url=")
+                {
+                    let location = el.source_location().bytes();
+                    handle_dangerous_link_2(url, location, &state.base, policy, logger, |x| {
+                        // SAFETY: we removed all invalid characters
+                        let _ = el.set_attribute(
+                            "content",
+                            &if x.as_ref().is_empty() {
+                                time.to_owned()
+                            } else {
+                                format!("{time};url={}", x.as_ref())
+                            },
+                        );
+                    })?;
+                }
+            }
             _ => {}
         }
 
@@ -264,7 +311,6 @@ pub fn create_rewriter<'a, W: Write>(
 
     let mut inline_script = String::new();
     let mut inline_script_location = None;
-
     handlers.push(text!("script", move |t| {
         use base64::{Engine, prelude::BASE64_STANDARD};
         use sha2::{Digest, Sha256};
@@ -289,7 +335,7 @@ pub fn create_rewriter<'a, W: Write>(
                 .iter()
                 .any(|allowed| allowed == &csp_hash);
             if is_allowed {
-                t.replace(&inline_script, lol_html::html_content::ContentType::Text);
+                t.replace(&inline_script, ContentType::Text);
             } else {
                 let start = inline_script_location.unwrap_or(0);
                 let end = t.source_location().bytes().end;
@@ -301,6 +347,23 @@ pub fn create_rewriter<'a, W: Write>(
             }
             inline_script.clear();
             inline_script_location = None;
+        }
+        Ok(())
+    }));
+
+    let mut inline_style = String::new();
+    handlers.push(text!("style", move |t| {
+        let mut state = state_2.lock();
+
+        inline_style.push_str(t.as_str());
+        t.remove();
+
+        if t.last_in_text_node() {
+            let (css, mut subresources) =
+                crate::resources::sanitize_css(&inline_style, &state.base);
+            t.replace(&css, ContentType::Text);
+            state.subresources.append(&mut subresources);
+            inline_style.clear();
         }
         Ok(())
     }));
