@@ -3,11 +3,10 @@ use crate::errors::SanitizerMessage;
 use crate::html::CrawlerState;
 use crate::html::create_rewriter;
 use crate::http_client::SanitizerHttpClient;
-use crate::log::Logger;
-use crate::log::LoggerTrait;
+use crate::log::ChannelLogger;
+use crate::log::Log;
 use crate::policy::Policy;
 use crate::resources::mime;
-use crate::resources::sanitize_css;
 use crate::resources::strip_jpeg_metadata;
 use crate::resources::strip_png_metadata;
 use crate::url::RuleMatch;
@@ -26,7 +25,7 @@ use url::Url;
 pub struct CrawlSession {
     pub client: Arc<SanitizerHttpClient>,
     pub policy: Arc<Policy>,
-    pub logger: Logger,
+    pub logger: ChannelLogger,
     pub rt_handle: tokio::runtime::Handle,
     pub output_dir: Arc<PathBuf>,
     pub url_map: Arc<Mutex<HashMap<Url, usize>>>,
@@ -38,7 +37,7 @@ impl CrawlSession {
     pub fn new(
         client: Arc<SanitizerHttpClient>,
         policy: Arc<Policy>,
-        logger: Logger,
+        logger: ChannelLogger,
         rt_handle: tokio::runtime::Handle,
         output_dir: Arc<PathBuf>,
         url_map: Arc<Mutex<HashMap<Url, usize>>>,
@@ -124,7 +123,12 @@ impl CrawlSession {
             strip_png_metadata(&fetched.data)
         } else if is_css {
             let css_str = String::from_utf8_lossy(&fetched.data);
-            let (sanitized_css, nested_urls) = sanitize_css(&css_str, &url);
+            let (sanitized_css, nested_urls) = crate::resources::css::sanitize(
+                &css_str,
+                &url,
+                &self.logger,
+                &self.policy.resources.dangerous_css,
+            )?;
             if depth < max_depth.value {
                 for (n_url, n_local) in nested_urls {
                     self.try_enqueue_subresource(n_url, n_local, depth + 1);
@@ -136,7 +140,7 @@ impl CrawlSession {
             crate::resources::javascript::sanitize(&js_str)
                 .map(|_| None)
                 .or_else(|e| {
-                    self.policy.resources.dangerous_js.handle(
+                    self.policy.resources.dangerous_js.handle_with(
                         &self.logger,
                         |x| x.as_bytes().to_vec(),
                         e,
@@ -251,7 +255,12 @@ impl CrawlSession {
         let data = fs::read(&path).map_err(|e| SanitizerError::ReadFile(path, e))?;
         let css_str = String::from_utf8_lossy(&data);
         let dummy_url = Url::parse("https://localhost").unwrap();
-        let (sanitized_css, _) = crate::resources::sanitize_css(&css_str, &dummy_url);
+        let (sanitized_css, _) = crate::resources::css::sanitize(
+            &css_str,
+            &dummy_url,
+            &self.logger,
+            &self.policy.resources.dangerous_css,
+        )?;
         fs::write(&output_path, sanitized_css.as_bytes())
             .map_err(|e| SanitizerError::WriteFile(output_path, e))?;
         Ok(())
@@ -265,7 +274,7 @@ impl CrawlSession {
         let to_write = crate::resources::javascript::sanitize(&js_str)
             .map(|_| None)
             .or_else(|e| {
-                self.policy.resources.dangerous_js.handle(
+                self.policy.resources.dangerous_js.handle_with(
                     &self.logger,
                     |x| x.as_bytes().to_vec(),
                     e,
@@ -324,11 +333,11 @@ impl CrawlSession {
     /// Worker task fetching a remote HTML document, sanitizing it, and enqueuing referenced sub-resources.
     pub async fn process_url(self: Arc<Self>, url: Url) {
         if let Some(original) = check_domain(&url)
-            && let Err(e) =
-                self.policy
-                    .urls
-                    .idn
-                    .handle(&self.logger, |_| {}, SanitizerError::Idn(original))
+            && let Err(e) = self
+                .policy
+                .urls
+                .idn
+                .handle(&self.logger, SanitizerError::Idn(original))
         {
             self.logger.error(e);
             return;

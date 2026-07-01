@@ -45,3 +45,22 @@ pub fn sanitize(content: &str) -> Result<(), SanitizerError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize() {
+        assert!(sanitize("console.log('hello');").is_ok());
+        assert!(sanitize("eval('1 + 1');").is_err());
+        assert!(sanitize("document.write('xss');").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_spaces() {
+        assert!(sanitize("eval    (  '1+1'  )").is_err());
+        assert!(sanitize("let evaluator = 1;").is_ok());
+        assert!(sanitize("document.write()").is_err());
+    }
+}

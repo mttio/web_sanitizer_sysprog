@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::{
     errors::SanitizerError,
-    log::{Logger, LoggerTrait},
+    log::Log,
     policy::{AttributeUrl, Policy},
     url::RuleMatch,
 };
@@ -20,7 +20,7 @@ fn handle_dangerous_link_2(
     location: Range<usize>,
     base_url: &Url,
     policy: &Policy,
-    logger: &Logger,
+    logger: &impl Log,
     mut replace: impl FnMut(&AttributeUrl),
 ) -> Result<Option<Url>, SanitizerError> {
     use unicode_normalization::UnicodeNormalization;
@@ -36,7 +36,7 @@ fn handle_dangerous_link_2(
                 policy
                     .urls
                     .idn
-                    .handle(logger, &mut replace, SanitizerError::Idn(original))?;
+                    .handle_with(logger, &mut replace, SanitizerError::Idn(original))?;
             }
 
             let host = host.to_owned();
@@ -48,7 +48,7 @@ fn handle_dangerous_link_2(
                 .any(|x| x.0.matches(&host));
 
             if is_dangerous {
-                policy.html.dangerous_domain.handle(
+                policy.html.dangerous_domain.handle_with(
                     logger,
                     |x| {
                         let new = match resolved.set_host(Some(x.as_ref())) {
@@ -87,7 +87,7 @@ fn handle_dangerous_link(
     attr_name: &str,
     base_url: &Url,
     policy: &Policy,
-    logger: &Logger,
+    logger: &impl Log,
 ) -> Result<Option<Url>, SanitizerError> {
     if let Some(attribute) = el.attributes().iter().find(|x| x.name() == attr_name) {
         let location = attribute
@@ -95,17 +95,17 @@ fn handle_dangerous_link(
             .unwrap_or(el.source_location())
             .bytes();
 
-        handle_dangerous_link_2(
+        Ok(handle_dangerous_link_2(
             &attribute.value(),
             location,
             base_url,
             policy,
             logger,
             |x| x.replace_attribute(attr_name, el),
-        )?;
+        )?)
+    } else {
+        Ok(None)
     }
-
-    Ok(None)
 }
 
 pub struct CrawlerState {
@@ -130,7 +130,7 @@ pub struct CrawlerState {
 /// # Returns
 /// * `HtmlRewriter<'a, impl FnMut(&[u8])>` - The configured rewriter instance.
 pub fn create_rewriter<'a, W: Write>(
-    logger: &'a Logger,
+    logger: &'a impl Log,
     policy: &'a Policy,
     state: &'a mut CrawlerState,
     mut output: W,
@@ -153,7 +153,7 @@ pub fn create_rewriter<'a, W: Write>(
 
         for (name, location) in event_attrs {
             let location = location.unwrap_or(el.source_location()).bytes();
-            policy.html.event_handlers.handle(
+            policy.html.event_handlers.handle_with(
                 logger,
                 |x| x.replace_attribute(&name, el),
                 SanitizerError::EventHandler(name.clone(), Some(location)),
@@ -172,7 +172,7 @@ pub fn create_rewriter<'a, W: Write>(
 
         for (name, value, location) in dangerous_uri_attrs {
             let location = location.unwrap_or(el.source_location()).bytes();
-            policy.html.dangerous_uris.handle(
+            policy.html.dangerous_uris.handle_with(
                 logger,
                 |x| x.replace_attribute(&name, el),
                 SanitizerError::DangerousUri(value, Some(location)),
@@ -359,8 +359,12 @@ pub fn create_rewriter<'a, W: Write>(
         t.remove();
 
         if t.last_in_text_node() {
-            let (css, mut subresources) =
-                crate::resources::sanitize_css(&inline_style, &state.base);
+            let (css, mut subresources) = crate::resources::css::sanitize(
+                &inline_style,
+                &state.base,
+                logger,
+                &policy.resources.dangerous_css,
+            )?;
             t.replace(&css, ContentType::Text);
             state.subresources.append(&mut subresources);
             inline_style.clear();
@@ -383,19 +387,13 @@ pub fn create_rewriter<'a, W: Write>(
 mod tests {
     use super::*;
     use crate::{
-        log::{LogLevel, Logger},
+        log::{LogLevel, NullLogger},
         policy::AttributeString,
         rules::RuleWithReplace,
     };
-    use std::sync::mpsc::{self, channel};
 
     #[test]
     fn test_event_handler_stripping() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let policy = Policy::default();
 
         let input_html = b"<button onclick=\"alert(1)\" class=\"btn\" ONLOAD=\"doSomething()\">Click me</button>";
@@ -405,7 +403,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -418,11 +416,6 @@ mod tests {
 
     #[test]
     fn test_event_handler_replacement() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.event_handlers =
             RuleWithReplace::new(AttributeString::new("alert('blocked')"), LogLevel::Info);
@@ -434,7 +427,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -444,11 +437,6 @@ mod tests {
 
     #[test]
     fn test_event_handler_ignore() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.event_handlers = RuleWithReplace::keep(LogLevel::Trace);
 
@@ -459,7 +447,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -469,11 +457,6 @@ mod tests {
 
     #[test]
     fn test_script_src_allowed() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.allow_scripts = vec!["trusted.com".to_owned()];
 
@@ -484,7 +467,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -494,11 +477,6 @@ mod tests {
 
     #[test]
     fn test_script_src_blocked() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.allow_scripts = vec!["trusted.com".to_owned()];
 
@@ -509,7 +487,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -520,11 +498,6 @@ mod tests {
 
     #[test]
     fn test_script_inline_allowed() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.allow_scripts =
             vec!["sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI=".to_owned()];
@@ -536,7 +509,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -546,11 +519,6 @@ mod tests {
 
     #[test]
     fn test_script_inline_blocked() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let policy = Policy::default();
 
         let input_html = b"<script>alert(1)</script>";
@@ -560,7 +528,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -570,11 +538,6 @@ mod tests {
 
     #[test]
     fn test_dangerous_uris_sanitization() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.dangerous_uris = RuleWithReplace::with_default(LogLevel::Info);
 
@@ -585,7 +548,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -597,11 +560,6 @@ mod tests {
 
     #[test]
     fn test_dangerous_uris_bypass_whitespace() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.dangerous_uris = RuleWithReplace::new(AttributeUrl::new(""), LogLevel::Info);
 
@@ -612,7 +570,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -623,11 +581,6 @@ mod tests {
 
     #[test]
     fn test_dangerous_uris_ignore() {
-        let (tx, _rx) = mpsc::channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
         let mut policy = Policy::default();
         policy.html.dangerous_uris = RuleWithReplace::keep(LogLevel::Trace);
 
@@ -638,7 +591,7 @@ mod tests {
             subresources: Vec::new(),
         };
 
-        let mut rewriter = create_rewriter(&logger, &policy, &mut state, &mut output);
+        let mut rewriter = create_rewriter(&NullLogger, &policy, &mut state, &mut output);
         rewriter.write(input_html).unwrap();
         rewriter.end().unwrap();
 
@@ -648,12 +601,6 @@ mod tests {
 
     #[test]
     fn test_idn_rewriting() {
-        let (tx, _rx) = channel();
-        let logger = Logger {
-            index: 0,
-            channel: tx,
-        };
-
         // Case 1: IDN is Warn. It should preserve the link.
         let mut policy = Policy::default();
         policy.urls.idn = RuleWithReplace::keep(LogLevel::Warn);
@@ -666,7 +613,8 @@ mod tests {
 
         let mut output = Vec::new();
         {
-            let mut rewriter = create_rewriter(&logger, &policy, &mut crawler_state, &mut output);
+            let mut rewriter =
+                create_rewriter(&NullLogger, &policy, &mut crawler_state, &mut output);
             rewriter
                 .write(b"<a href=\"http://googl\xC3\xA9.com\">Link</a>")
                 .unwrap();
@@ -682,7 +630,8 @@ mod tests {
         policy.urls.idn = RuleWithReplace::with_default(LogLevel::Warn);
         let mut output2 = Vec::new();
         {
-            let mut rewriter = create_rewriter(&logger, &policy, &mut crawler_state, &mut output2);
+            let mut rewriter =
+                create_rewriter(&NullLogger, &policy, &mut crawler_state, &mut output2);
             rewriter
                 .write(b"<a href=\"http://googl\xC3\xA9.com\">Link</a>")
                 .unwrap();

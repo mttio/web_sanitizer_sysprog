@@ -6,12 +6,36 @@ use std::sync::mpsc::{Receiver, Sender};
 use chrono::Local;
 use colored::Colorize;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::SanitizerMessage;
 use crate::policy::Policy;
 
-pub trait LoggerTrait {
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// Returns `Err` if `self == Error`, otherwise returns `Ok` and logs the message
+    pub fn handle<T: Into<SanitizerMessage>>(self, logger: &impl Log, message: T) -> Result<(), T> {
+        if self == LogLevel::Error {
+            Err(message)
+        } else {
+            logger.log(self, message);
+            Ok(())
+        }
+    }
+}
+
+/// A trait for logging messages
+pub trait Log: Sync {
     fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T);
 
     #[inline]
@@ -41,38 +65,12 @@ pub trait LoggerTrait {
 }
 
 #[derive(Clone)]
-pub struct Logger {
+pub struct ChannelLogger {
     pub index: usize,
     pub channel: Sender<LoggerMessage>,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl LogLevel {
-    /// Returns `Err` if `self == Error`, otherwise returns `Ok` and logs the message
-    pub fn handle<T: Into<SanitizerMessage>>(
-        self,
-        logger: &impl LoggerTrait,
-        message: T,
-    ) -> Result<(), T> {
-        if self == LogLevel::Error {
-            Err(message)
-        } else {
-            logger.log(self, message);
-            Ok(())
-        }
-    }
-}
-
-impl LoggerTrait for Logger {
+impl Log for ChannelLogger {
     fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T) {
         self.channel
             .send(LoggerMessage {
@@ -84,7 +82,7 @@ impl LoggerTrait for Logger {
     }
 }
 
-impl LoggerTrait for (usize, &Sender<LoggerMessage>) {
+impl Log for (usize, &Sender<LoggerMessage>) {
     fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T) {
         self.1
             .send(LoggerMessage {
@@ -100,6 +98,30 @@ pub struct LoggerMessage {
     source: usize,
     level: LogLevel,
     message: SanitizerMessage,
+}
+
+/// A logger that stores messages in a `Vec`, with interior mutability
+#[derive(Default)]
+pub struct VecLogger(Mutex<Vec<(LogLevel, SanitizerMessage)>>);
+
+impl VecLogger {
+    pub fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+}
+
+impl Log for VecLogger {
+    fn log<T: Into<SanitizerMessage>>(&self, level: LogLevel, message: T) {
+        self.0.lock().push((level, message.into()));
+    }
+}
+
+/// A logger that discards all messages
+#[derive(Default)]
+pub struct NullLogger;
+
+impl Log for NullLogger {
+    fn log<T: Into<SanitizerMessage>>(&self, _: LogLevel, _: T) {}
 }
 
 pub fn logging_thread(
@@ -182,7 +204,7 @@ mod tests {
         .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let logger = Logger {
+        let logger = ChannelLogger {
             index: 0,
             channel: tx,
         };
