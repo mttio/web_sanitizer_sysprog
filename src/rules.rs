@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     errors::SanitizerError,
-    log::{LogLevel, LoggerTrait},
+    log::{Log, LogLevel},
 };
 
 #[nutype(
@@ -52,16 +52,28 @@ impl<R: Default> RuleWithReplace<R> {
     }
 
     /// Returns `Err` if `self.level == Error`
-    /// Otherwise logs the message, calls `replace` with the contained value and return `Ok`
-    pub fn handle<T, F: FnOnce(&R) -> T, M: Into<SanitizerError>>(
+    /// Otherwise logs the message, calls `replace` with the contained value and returns `Ok` with the mapped value
+    pub fn handle_with<T, F: FnOnce(&R) -> T, M: Into<SanitizerError>>(
         &self,
-        logger: &impl LoggerTrait,
+        logger: &impl Log,
         replace: F,
         message: M,
     ) -> Result<Option<T>, M> {
         self.level
             .handle(logger, message)
             .map(|_| self.replace.as_ref().map(replace))
+    }
+
+    /// Returns `Err` if `self.level == Error`
+    /// Otherwise logs the message and returns `Ok` with the replace value
+    pub fn handle<M: Into<SanitizerError>>(
+        &self,
+        logger: &impl Log,
+        message: M,
+    ) -> Result<Option<&R>, M> {
+        self.level
+            .handle(logger, message)
+            .map(|_| self.replace.as_ref())
     }
 }
 
@@ -113,11 +125,7 @@ impl<T> RuleWithValue<T> {
         Self { value, level }
     }
 
-    pub fn handle<M: Into<SanitizerError>>(
-        &self,
-        logger: &impl LoggerTrait,
-        message: M,
-    ) -> Result<(), M> {
+    pub fn handle<M: Into<SanitizerError>>(&self, logger: &impl Log, message: M) -> Result<(), M> {
         self.level.handle(logger, message)
     }
 }

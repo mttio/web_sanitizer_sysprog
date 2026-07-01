@@ -1,7 +1,7 @@
 use crate::engine_structs::{FetchedContent, InputSource};
 use crate::errors::SanitizerError;
 use crate::html::{CrawlerState, create_rewriter};
-use crate::log::{Logger, LoggerMessage};
+use crate::log::{Log, LoggerMessage};
 use crate::policy::Policy;
 use crate::url::{RuleMatch, check_domain};
 use std::path::Path;
@@ -190,7 +190,7 @@ impl SanitizerHttpClient {
                         policy
                             .urls
                             .idn
-                            .handle(&logger, |_| {}, SanitizerError::Idn(original))?;
+                            .handle(&logger, SanitizerError::Idn(original))?;
                     }
 
                     let max_redirects = policy.connections.max_redirects;
@@ -241,7 +241,7 @@ impl SanitizerHttpClient {
     pub async fn fetch_raw(
         &self,
         url: &Url,
-        _logger: &Logger,
+        _logger: &impl Log,
         _policy: &Policy,
         remaining_bytes: usize,
     ) -> Result<FetchedContent, SanitizerError> {
@@ -325,7 +325,7 @@ impl SanitizerHttpClient {
     pub async fn fetch_and_sanitize_html(
         &self,
         url: &Url,
-        logger: &Logger,
+        logger: &impl Log,
         output_path: &Path,
         policy: &Policy,
     ) -> Result<CrawlerState, SanitizerError> {

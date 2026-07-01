@@ -12,7 +12,7 @@ use crate::{
     engine_structs::InputSource,
     errors::SanitizerError,
     http_client::SanitizerHttpClient,
-    log::{Logger, LoggerMessage},
+    log::{ChannelLogger, LoggerMessage},
     policy::Policy,
 };
 
@@ -52,7 +52,7 @@ pub fn library(
     )?);
 
     for (i, source) in sources.into_iter().enumerate() {
-        let logger = Logger {
+        let logger = ChannelLogger {
             index: i,
             channel: tx.clone(),
         };

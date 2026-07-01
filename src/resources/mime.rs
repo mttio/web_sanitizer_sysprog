@@ -95,7 +95,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sniff_mime() {
+    fn test_sniff() {
         assert_eq!(
             sniff(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
             Some(KnownMime::Png)
@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_mime() {
+    fn test_validate() {
         assert!(validate(
             Some("image/png"),
             sniff(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])

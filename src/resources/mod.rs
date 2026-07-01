@@ -1,3 +1,4 @@
+pub mod css;
 pub mod javascript;
 pub mod mime;
 
@@ -141,126 +142,6 @@ pub fn strip_png_metadata(data: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Scans CSS content for @import and url(...) references, validates/rewrites them, and extracts them.
-///
-/// # Inputs
-/// * `css` - A string slice containing the CSS source code.
-/// * `base_url` - The base URL of the CSS file used to resolve relative imports/links.
-///
-/// # Returns
-/// * `(String, Vec<(Url, String)>)` - A tuple containing:
-///   1. The rewritten CSS string with references updated to local filenames.
-///   2. A vector of tuples pairing the fully resolved absolute URLs of discovered sub-resources with their generated local filenames.
-pub fn sanitize_css(css: &str, base_url: &Url) -> (String, Vec<(Url, String)>) {
-    let mut output = String::new();
-    let mut extracted = Vec::new();
-    let chars: Vec<char> = css.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        // Match @import
-        if i + 7 < chars.len()
-            && chars[i..i + 7] == ['@', 'i', 'm', 'p', 'o', 'r', 't']
-            && (chars[i + 7].is_whitespace() || chars[i + 7] == '(')
-        {
-            i += 7;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            let mut url_str = String::new();
-            if i + 4 <= chars.len() && chars[i..i + 4] == ['u', 'r', 'l', '('] {
-                i += 4;
-                while i < chars.len() && chars[i] != ')' {
-                    url_str.push(chars[i]);
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                }
-            } else if i < chars.len() && (chars[i] == '"' || chars[i] == '\'') {
-                let quote = chars[i];
-                i += 1;
-                while i < chars.len() && chars[i] != quote {
-                    url_str.push(chars[i]);
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                }
-            } else {
-                while i < chars.len() && chars[i] != ';' {
-                    url_str.push(chars[i]);
-                    i += 1;
-                }
-            }
-
-            while i < chars.len() && chars[i] != ';' {
-                i += 1;
-            }
-            if i < chars.len() && chars[i] == ';' {
-                i += 1;
-            }
-
-            let url_clean = url_str
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim()
-                .to_string();
-            if !url_clean.is_empty()
-                && let Ok(resolved_url) = base_url.join(&url_clean)
-            {
-                let local_name = generate_local_filename(&resolved_url, "css");
-                extracted.push((resolved_url, local_name.clone()));
-                output.push_str(&format!("@import \"{}\";", local_name));
-            }
-            continue;
-        }
-
-        // Match url(
-        if i + 4 <= chars.len() && chars[i..i + 4] == ['u', 'r', 'l', '('] {
-            i += 4;
-            let mut url_str = String::new();
-            while i < chars.len() && chars[i] != ')' {
-                url_str.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1;
-            }
-
-            let url_clean = url_str
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim()
-                .to_string();
-            if url_clean.starts_with("data:") || url_clean.starts_with("javascript:") {
-                output.push_str("url(\"\")");
-            } else if let Ok(resolved_url) = base_url.join(&url_clean) {
-                let ext = url_clean
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("bin")
-                    .split('?')
-                    .next()
-                    .unwrap_or("bin");
-                let local_name = generate_local_filename(&resolved_url, ext);
-                extracted.push((resolved_url, local_name.clone()));
-                output.push_str(&format!("url(\"{}\")", local_name));
-            } else {
-                output.push_str("url(\"\")");
-            }
-            continue;
-        }
-
-        output.push(chars[i]);
-        i += 1;
-    }
-
-    (output, extracted)
-}
-
 pub fn scan_pdf_for_active_content(data: &[u8]) -> Result<(), SanitizerError> {
     let mut i = 0;
     while i < data.len() {
@@ -383,6 +264,10 @@ impl EntityScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        log::{LogLevel, NullLogger},
+        rules::RuleWithReplace,
+    };
 
     #[test]
     fn test_entity_scanner() {
@@ -437,32 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_javascript() {
-        assert!(javascript::sanitize("console.log('hello');").is_ok());
-        assert!(javascript::sanitize("eval('1 + 1');").is_err());
-        assert!(javascript::sanitize("document.write('xss');").is_err());
-    }
-
-    #[test]
-    fn test_sanitize_css() {
-        let base_url = Url::parse("https://example.com/dir/style.css").unwrap();
-        let css = "body { background: url('img.png'); } @import 'common.css';";
-        let (rewritten, extracted) = sanitize_css(css, &base_url);
-
-        assert!(rewritten.contains("url(\"sub_"));
-        assert!(rewritten.contains("@import \"sub_"));
-        assert_eq!(extracted.len(), 2);
-        assert_eq!(
-            extracted[0].0,
-            Url::parse("https://example.com/dir/img.png").unwrap()
-        );
-        assert_eq!(
-            extracted[1].0,
-            Url::parse("https://example.com/dir/common.css").unwrap()
-        );
-    }
-
-    #[test]
     fn test_generate_local_filename() {
         let url1 = Url::parse("https://example.com/asset.js?v=2").unwrap();
         let name1 = generate_local_filename(&url1, "bin");
@@ -479,22 +338,6 @@ mod tests {
         assert!(!name3.contains(".."));
         assert!(!name3.contains('/'));
         assert!(!name3.contains('\\'));
-    }
-
-    #[test]
-    fn test_sanitize_javascript_spaces() {
-        assert!(javascript::sanitize("eval    (  '1+1'  )").is_err());
-        assert!(javascript::sanitize("let evaluator = 1;").is_ok());
-        assert!(javascript::sanitize("document.write()").is_err());
-    }
-
-    #[test]
-    fn test_sanitize_css_dangerous_uris() {
-        let base_url = Url::parse("https://example.com/style.css").unwrap();
-        let css = "body { background: url('data:image/png;base64,1234'); font: url('javascript:alert(1)'); }";
-        let (rewritten, extracted) = sanitize_css(css, &base_url);
-        assert!(rewritten.contains("url(\"\")"));
-        assert_eq!(extracted.len(), 0);
     }
 
     #[test]
@@ -531,8 +374,13 @@ mod tests {
         // CSS and JS disk file validation checks
         let css_file_data =
             std::fs::read_to_string("input_test_files/malicious/dangerous_styles.css").unwrap();
-        let (clean_css, _) =
-            sanitize_css(&css_file_data, &Url::parse("https://localhost").unwrap());
+        let (clean_css, _) = crate::resources::css::sanitize(
+            &css_file_data,
+            &Url::parse("https://localhost").unwrap(),
+            &NullLogger,
+            &RuleWithReplace::with_default(LogLevel::Warn),
+        )
+        .unwrap();
         assert!(clean_css.contains("url(\"\")"));
 
         let js_file_data =

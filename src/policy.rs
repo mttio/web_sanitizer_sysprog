@@ -175,6 +175,7 @@ pub struct ResourcesPolicy {
     pub unknown_resource: LogLevel,
     pub pdf_active_content: LogLevel,
     pub dangerous_js: RuleWithReplace<JsReplace>,
+    pub dangerous_css: RuleWithReplace<String>,
 }
 
 impl Default for ResourcesPolicy {
@@ -188,6 +189,7 @@ impl Default for ResourcesPolicy {
             unknown_resource: LogLevel::Error,
             pdf_active_content: LogLevel::Error,
             dangerous_js: RuleWithReplace::with_default(LogLevel::Error),
+            dangerous_css: RuleWithReplace::with_default(LogLevel::Warn),
         }
     }
 }
